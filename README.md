@@ -49,6 +49,36 @@ python3 codes/main.py benchmarks/qplib_fully_passed/QPLIB_0067.qplib -s RC2 --ve
 python3 codes/main.py benchmarks/diverse_sat/ais/ais10.cnf --k 2 -e BIN
 ```
 
+## Python API
+
+NLIPSat also exposes a small Python API for constructing and inspecting the
+generated WCNF formula object before solving:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e .
+python3 examples/api_example.py
+```
+
+```python
+from nlipsat import load_problem, EncodingConfig, \
+                    build_wcnf, solve, verify_solution
+
+problem = load_problem("examples/example4.json")  # .qplib .smt2 .cnf also accepted
+cfg = EncodingConfig()  # use_decomposition=True for order decomp
+
+wcnf, name2idx, vpool = build_wcnf(problem, "BIN", cfg)
+print(len(wcnf.hard), len(wcnf.soft), wcnf.wght, wcnf.topw)
+# 18 4 [1, 2, 2, 4] 10
+
+wcnf.to_file("example.wcnf")
+result = solve(problem, encoding="BIN", config=cfg, solver="RC2")
+ok, report = verify_solution(problem, result)
+print(result["objective_value"], ok)
+# 2 True
+```
+
 ### Generate WCNF only (no solving)
 
 If you only want to build the weighted CNF encoding (for inspection or for running a third-party MaxSAT solver manually), use solver `NONE`:

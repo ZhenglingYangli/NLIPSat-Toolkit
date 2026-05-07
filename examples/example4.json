@@ -1,0 +1,20 @@
+{
+    "variables": {
+        "X1": {"lb": 0, "ub": 2},
+        "X2": {"lb": 0, "ub": 2}
+    },
+    "objective": {
+        "sense": "max",
+        "terms": [{"c": 1, "vars": {"X1": 1, "X2": 1}}]
+    },
+    "constraints": [
+        {
+            "terms": [
+                {"c": 1, "vars": {"X1": 1}},
+                {"c": 1, "vars": {"X2": 1}}
+            ],
+            "sense": "<=",
+            "rhs": 3
+        }
+    ]
+}
