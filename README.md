@@ -171,3 +171,10 @@ For each run, the tool prints a compact summary line containing:
 
 With `--verbose`, the tool prints additional encoding and timing details. With `--verify`, it also checks whether the decoded assignment satisfies the original constraints and whether the reported objective is consistent.
 
+## References
+
+If you use NLIPSat, please cite the following papers:
+
+- Zhengling Yangli, Zhifei Zheng, Sami Cherif, Rui Sá Shibasaki, and Chu-Min Li. *NLIPSat: Satisfiability-Based Nonlinear Integer Programming Encoding Toolkit*. In Proceedings of the 29th International Conference on Theory and Applications of Satisfiability Testing (SAT 2026), LIPIcs, to appear.
+- Zhifei Zheng, Sami Cherif, Rui Sá Shibasaki, Chu-Min Li, and Jialu Zhang. *Maximum Satisfiability Formulations for Nonlinear Integer Programming*. In Proceedings of the 19th European Conference on Logics in Artificial Intelligence (JELIA 2025), LNCS 16094, pp. 190--206, Springer, 2025. DOI: [10.1007/978-3-032-04590-4_14](https://doi.org/10.1007/978-3-032-04590-4_14).
+
