@@ -140,9 +140,14 @@ def solve(
 
         * ``"encoding"``         – encoding name used
         * ``"solver"``           – solver name used
-        * ``"solver_status"``    – ``"OPTIMAL"``, ``"FEASIBLE"``, or
-          ``"TIMEOUT"``
+        * ``"solver_status"``    – ``"OPTIMAL"``, ``"FEASIBLE"``, ``"UNSAT"``,
+          ``"TIMEOUT"``, ``"UNKNOWN"``, or ``"INVALID"``
         * ``"objective_value"``  – decoded NLIP objective value (int or float)
+        * ``"objective_value_exact"`` – exact integer or rational value as text
+        * ``"verified"`` – original-problem witness check
+        * ``"decomposition_effective"`` – whether arithmetic multiplication was used
+        * ``"num_multiplications"`` – generated arithmetic multiplication nodes
+        * ``"multiplication_cache_hits"`` – reused arithmetic multiplication nodes
         * ``"maxsat_cost"``      – raw MaxSAT cost
         * ``"assignment"``       – list of signed Boolean literals
         * ``"name2idx"``         – variable-name map

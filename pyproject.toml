@@ -8,9 +8,9 @@ version = "0.1.0"
 description = "Python API wrapper for the NLIPSat research toolkit"
 requires-python = ">=3.10"
 dependencies = [
-    "python-sat[pblib,aiger]",
+    "python-sat[pblib]",
     "z3-solver",
 ]
 
 [tool.setuptools]
-packages = ["nlipsat"]
+packages = ["nlipsat", "codes", "codes.encoders", "codes.solver", "codes.tools"]

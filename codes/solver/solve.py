@@ -2,20 +2,22 @@ import os
 import subprocess
 import tempfile
 import time
+import sys
+import pickle
+from pathlib import Path
 from math import gcd
 from functools import reduce
 from pysat.formula import WCNF, IDPool
 from pysat.examples.rc2 import RC2
 from encoders.encoder_driver import encode_objective, add_domain_constraints, encode_constraints
 from .config import EncodingConfig
-from tools.preprocessing import preprocess_problem
+from tools.preprocessing import preprocess_problem, EncodingTimeoutError
+from fractions import Fraction
+from tools.verify import verify_solution
 
 
-class EncodingTimeoutError(RuntimeError):
-    pass
-
-
-def _preprocess_wcnf(wcnf):
+def _preprocess_wcnf(wcnf, cfg=None):
+    _check_encoding_deadline(cfg, "WCNF simplification")
     if not wcnf.hard:
         return
 
@@ -24,85 +26,71 @@ def _preprocess_wcnf(wcnf):
     # Unit propagation on hard clauses
     units = set()
     for clause in wcnf.hard:
+        _check_encoding_deadline(cfg, "unit propagation")
         if len(clause) == 1:
             units.add(clause[0])
 
     if units:
         new_hard = []
         for clause in wcnf.hard:
+            _check_encoding_deadline(cfg, "unit propagation")
+            if not clause:
+                # Preserve an existing contradiction.  Dropping this clause
+                # would turn an UNSAT hard formula into a satisfiable one.
+                new_hard.append(clause)
+                continue
             if any(lit in units for lit in clause):
                 if len(clause) == 1:
                     new_hard.append(clause)
                 continue
             new_clause = [lit for lit in clause if -lit not in units]
-            if new_clause:
-                new_hard.append(new_clause)
+            new_hard.append(new_clause)
         wcnf.hard = new_hard
 
-    # Subsumption on hard clauses: remove clauses subsumed by shorter ones.
-    # Only process if clause count is manageable to avoid quadratic blowup.
-    if len(wcnf.hard) < 500_000:
-        clause_sets = [(frozenset(c), i) for i, c in enumerate(wcnf.hard)]
-        clause_sets.sort(key=lambda x: len(x[0]))
-        subsumed = set()
-        short_clauses = []
-        for cs, idx in clause_sets:
-            if idx in subsumed:
+    # Index only strictly shorter clauses. Bound candidate comparisons by
+    # input size so a shared literal cannot cause a quadratic scan.
+    subsumption_applied = len(wcnf.hard) < 50_000
+    if subsumption_applied:
+        unique = set()
+        for clause in wcnf.hard:
+            _check_encoding_deadline(cfg, "subsumption")
+            unique.add(frozenset(clause))
+        unique = sorted(unique, key=lambda c: (len(c), tuple(sorted(c))))
+        by_size = {size: {} for size in (1, 2, 3)}
+        comparisons_left = 4 * sum(map(len, unique))
+        retained = []
+
+        def subsumed(cs):
+            nonlocal comparisons_left
+            for size in range(1, min(len(cs), 4)):
+                index = by_size[size]
+                for lit in cs:
+                    for sc in index.get(lit, ()):
+                        _check_encoding_deadline(cfg, "subsumption")
+                        if comparisons_left == 0:
+                            return False
+                        comparisons_left -= 1
+                        if sc.issubset(cs):
+                            return True
+            return False
+
+        for cs in unique:
+            _check_encoding_deadline(cfg, "subsumption")
+            if not cs:
+                retained = [[]]
+                break
+            if comparisons_left and subsumed(cs):
                 continue
-            for sc, _ in short_clauses:
-                if len(sc) < len(cs) and sc.issubset(cs):
-                    subsumed.add(idx)
-                    break
-            if idx not in subsumed and len(cs) <= 3:
-                short_clauses.append((cs, idx))
+            retained.append(sorted(cs))
+            if len(cs) <= 3:
+                by_size[len(cs)].setdefault(min(cs), []).append(cs)
+        wcnf.hard = retained
 
-        if subsumed:
-            wcnf.hard = [c for i, c in enumerate(wcnf.hard) if i not in subsumed]
-
+    _check_encoding_deadline(cfg, "WCNF simplification")
     removed = orig_hard - len(wcnf.hard)
     if removed > 0:
         print(f"  [wcnf-preprocess] removed {removed} hard clauses "
-              f"(units: {len(units)}, subsumption applied)")
-
-
-def _add_lp_relaxation_bound(problem, wcnf, vpool, encoding, weight_gcd):
-    variables = problem.get('variables', {}) or {}
-    for info in variables.values():
-        if int(info.get('lb', 0)) != 0 or int(info.get('ub', 0)) != 1:
-            return
-
-    terms = problem.get('objective', {}).get('terms', [])
-    if not terms:
-        return
-
-    # Compute LP relaxation lower bound: for each term, the LP min over [0,1]^n
-    # with McCormick envelopes.  For uncorrelated terms (no LP coupling):
-    #   linear c*x: min = min(0, c)
-    #   quadratic c*x*y: LP min = min(0, c) (McCormick: w in [0,1], LP can set w=0 if c>0, w=1 if c<0)
-    # This is a valid but loose bound. More importantly, we derive an upper bound
-    # on the MaxSAT cost to add as a hard PB constraint.
-    lp_lb = 0
-    for t in terms:
-        c_val = int(t.get('c', 0))
-        if c_val < 0:
-            lp_lb += c_val
-
-    neg_offset = getattr(wcnf, '_neg_soft_total', 0)
-    total_soft = sum(wcnf.wght)
-
-    # Objective = (total_soft - cost - neg_offset) * weight_gcd + const
-    # LP_lb <= objective  =>  cost <= total_soft - neg_offset - lp_lb / weight_gcd
-    if weight_gcd > 0:
-        max_cost = total_soft - neg_offset - (lp_lb // weight_gcd)
-    else:
-        return
-
-    if max_cost >= total_soft or max_cost <= 0:
-        return
-
-    wcnf._lp_cost_bound = max_cost
-    print(f"  [lp-bound] QBB LP relaxation bound: max_cost={max_cost} "
-          f"(total={total_soft}, lp_lb={lp_lb})")
+              f"(units: {len(units)}, subsumption: {subsumption_applied})")
 
 
 def _check_encoding_deadline(cfg, phase_name=""):
@@ -112,23 +100,28 @@ def _check_encoding_deadline(cfg, phase_name=""):
             f"Encoding deadline exceeded during {phase_name}")
 
 
+def _write_wcnf(wcnf, path):
+    """Write the classic format consumed by the bundled MaxSAT solvers."""
+    from inspect import signature
+    options = {'format': 'legacy'} if 'format' in signature(wcnf.to_file).parameters else {}
+    wcnf.to_file(path, **options)
+
+
 def build_wcnf(problem, encoding, cfg, collect_timings=False):
     timings = {} if collect_timings else None
 
-    # 0. Preprocessing
+    stats = problem.get('_parse_stats', {})
+    if stats.get('skipped') or stats.get('defaulted_bounds'):
+        raise ValueError('cannot encode an incomplete or artificially bounded SMT translation')
+
+    # Exact normalization is required even when optional optimizations are off.
     t0 = time.time()
-    preprocess_meta = None
-    if getattr(cfg, 'enable_preprocess', False):
-        processed_problem, meta = preprocess_problem(
-            problem,
-            denom_cap=10**6,
-            scale_limit=getattr(cfg, 'preprocess_scale_limit', 10**6),
-            enable_min_to_max=True,
-            enable_integerize=getattr(cfg, 'preprocess_integerize', True)
-        )
-        problem = processed_problem
-        preprocess_meta = meta
-        print("  [preprocess] enabled: variable shift / normalization / integerization / objective normalization")
+    processed_problem, preprocess_meta = preprocess_problem(
+        problem, scale_limit=cfg.preprocess_scale_limit,
+        enable_integerize=cfg.preprocess_integerize,
+        enable_optimizations=cfg.enable_preprocess,
+        deadline=cfg.encoding_deadline)
+    problem = processed_problem
     if collect_timings:
         timings['preprocess'] = time.time() - t0
     _check_encoding_deadline(cfg, "preprocessing")
@@ -169,7 +162,7 @@ def build_wcnf(problem, encoding, cfg, collect_timings=False):
     _check_encoding_deadline(cfg, "objective encoding")
 
     if encoding == 'BIN' and hasattr(cfg, '_global_and_cache'):
-        cache_size = len(cfg._global_and_cache)
+        cache_size = sum(isinstance(key, frozenset) for key in cfg._global_and_cache) + len(cfg._global_and_cache.get('_lin_prod_cache', {}))
         if cache_size > 0:
             print(f"  [global-cache] shared AND-gate cache: {cache_size} gates")
         del cfg._global_and_cache
@@ -196,14 +189,8 @@ def build_wcnf(problem, encoding, cfg, collect_timings=False):
             print(f"  [weight-norm] GCD={weight_gcd}, weights reduced {weight_gcd}x")
     wcnf._weight_gcd = weight_gcd
 
-    # For unconstrained binary quadratic problems (QBB), add an implied upper
-    # bound constraint on the MaxSAT cost based on LP relaxation.
-    constraints = problem.get('constraints', []) or []
-    if not constraints and wcnf.wght:
-        _add_lp_relaxation_bound(problem, wcnf, vpool, encoding, weight_gcd)
-
     # WCNF-level preprocessing: unit propagation and subsumption
-    _preprocess_wcnf(wcnf)
+    _preprocess_wcnf(wcnf, cfg)
 
     wcnf.topw = sum(wcnf.wght) + 1
 
@@ -220,155 +207,123 @@ def build_wcnf(problem, encoding, cfg, collect_timings=False):
     return wcnf, name2idx, vpool
 
 
-def _greedy_to_phases(greedy_sol, problem, encoding, vpool):
-    """Convert a greedy variable assignment to SAT phase hints."""
-    import math
-    if not greedy_sol:
-        return []
-    phases = []
-    variables = problem.get('variables', {})
-    var_names = sorted(variables.keys())
-    name2idx = {name: i + 1 for i, name in enumerate(var_names)}
-    for vn, val in greedy_sol.items():
-        if vn not in name2idx:
-            continue
-        q = name2idx[vn]
-        ub = int(variables[vn].get('ub', 0))
-        val = max(0, min(int(val), ub))
-        if encoding == 'OH':
-            for r in range(ub + 1):
-                vid = vpool.id(f'x_{q}@{r}')
-                phases.append(vid if r == val else -vid)
-        elif encoding == 'UNA':
-            for r in range(ub + 1):
-                vid = vpool.id(f'x_{q}@{r}')
-                phases.append(vid if r <= val else -vid)
-        elif encoding == 'BIN':
-            nb = math.ceil(math.log2(ub + 1)) if ub > 0 else 1
-            for r in range(nb):
-                vid = vpool.id(f'x_{q}@{r}')
-                phases.append(vid if (val >> r) & 1 else -vid)
-    return phases
+def solve_rc2(wcnf, phases=None, timeout=0):
+    """Return (cost, model); UNSAT is (-1, []), timeout is (-1, None).
 
-
-def solve_rc2(wcnf, phases=None):
+    A positive timeout isolates RC2 in a child process because native SAT
+    calls can ignore interrupts. The child is killed and reaped on timeout.
+    """
+    if timeout > 0:
+        deadline = time.monotonic() + timeout
+        worker = (
+            "import sys,pickle; sys.path.insert(0,sys.argv[1]); "
+            "from solver.solve import solve_rc2; from pysat.formula import WCNF; "
+            "nv,hard,soft,weights,topw,phases=pickle.load(sys.stdin.buffer); "
+            "w=WCNF(); w.nv=nv; w.hard=hard; w.soft=soft; w.wght=weights; w.topw=topw; "
+            "pickle.dump(solve_rc2(w,phases),sys.stdout.buffer)"
+        )
+        payload = pickle.dumps((wcnf.nv, wcnf.hard, wcnf.soft, wcnf.wght, wcnf.topw, phases),
+                               protocol=pickle.HIGHEST_PROTOCOL)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return -1, None
+        try:
+            completed = subprocess.run(
+                [sys.executable, '-c', worker, str(Path(__file__).resolve().parents[1])],
+                input=payload, capture_output=True, timeout=remaining, check=True)
+        except subprocess.TimeoutExpired:
+            return -1, None
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError('RC2 worker failed: ' + exc.stderr.decode(errors='replace')) from exc
+        result = pickle.loads(completed.stdout)
+        return (-1, None) if time.monotonic() >= deadline else result
+    solver = None
     try:
         solver = RC2(wcnf, adapt=True, exhaust=True, trim=3)
         if phases:
-            try:
-                solver.oracle.set_phases(phases)
-            except Exception:
-                pass
+            solver.oracle.set_phases(phases)
         solution = solver.compute()
-
-        if solution is None:
-            return -1, []
-
-        cost = solver.cost
-        assignment = solution
-        solver.delete()
-
-        return cost, assignment
-
-    except Exception as e:
-        raise RuntimeError(f"RC2 failed: {e}")
-
-
-def _compute_greedy_cost(wcnf, phases):
-    """Compute MaxSAT cost of the greedy solution from phase hints.
-    Counts the total weight of soft clauses unsatisfied by the assignment."""
-    if not phases:
-        return None
-    assign_set = set(phases)
-    cost = 0
-    for clause, weight in zip(wcnf.soft, wcnf.wght):
-        satisfied = any(lit in assign_set for lit in clause)
-        if not satisfied:
-            cost += weight
-    return cost
+        return (-1, []) if solution is None else (solver.cost, solution)
+    except TimeoutError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f'RC2 failed: {exc}') from exc
+    finally:
+        if solver is not None:
+            solver.delete()
 
 
 def solve_external(wcnf, workdir, solver_path, timeout=0, greedy_cost=None):
-    with tempfile.NamedTemporaryFile(
-        mode='w',
-        suffix='.wcnf',
-        dir=workdir,
-        delete=False
-    ) as f:
+    deadline = time.monotonic() + timeout if timeout and timeout > 0 else None
+    with tempfile.NamedTemporaryFile(suffix='.wcnf', dir=workdir, delete=False) as f:
         wcnf_path = f.name
-        wcnf.to_file(wcnf_path)
+    try:
+        _write_wcnf(wcnf, wcnf_path)
+        cmd = [solver_path]
+        if os.path.basename(solver_path).lower().startswith('maxhs'):
+            cmd.extend(['-printSoln', '-printSoln-old-format'])
+        remaining = deadline - time.monotonic() if deadline is not None else None
+        if remaining is not None and remaining <= 0:
+            return -1, None, 'TIMEOUT'
+        if remaining is not None and int(remaining) > 0:
+            cmd.append(f'-cpu-lim={int(remaining)}')
+        cmd.append(wcnf_path)
+        timed_out = False
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=remaining)
+            output, returncode = proc.stdout or '', proc.returncode
+            if returncode not in (0, 1, 10, 20, 30):
+                raise RuntimeError(f'external solver failed: rc={returncode}; {(proc.stderr or "")[-2000:]}')
+        except subprocess.TimeoutExpired as exc:
+            output = exc.stdout or ''
+            if isinstance(output, bytes):
+                output = output.decode(errors='replace')
+            returncode, timed_out = 0, True
+        status_line, cost, model_lines = '', None, []
+        in_model = False
+        for raw in output.splitlines():
+            line = raw.strip()
+            if line.startswith('s '):
+                status_line = line[2:].strip()
+                in_model = False
+            elif line.startswith('o '):
+                cost = int(line.split()[1])
+                in_model = False
+            elif line.startswith('v '):
+                if not in_model:
+                    model_lines = []
+                model_lines.append(line[2:].strip())
+                in_model = True
+        declared = {'OPTIMUM FOUND': 'OPTIMAL', 'SATISFIABLE': 'FEASIBLE',
+                    'UNSATISFIABLE': 'UNSAT'}.get(status_line)
+        exit_status = {10: 'FEASIBLE', 20: 'UNSAT', 30: 'OPTIMAL'}.get(returncode)
+        if declared and exit_status and ((declared == 'UNSAT') != (exit_status == 'UNSAT')):
+            return -1, None, 'INVALID'
+        status = declared or exit_status
+        if status == 'UNSAT':
+            return -1, None, status
+        if not model_lines and wcnf.nv:
+            if status in ('OPTIMAL', 'FEASIBLE'):
+                return -1, None, 'INVALID'
+            return -1, None, 'TIMEOUT' if timed_out else 'UNKNOWN'
+        tokens = ' '.join(model_lines).split()
+        if len(tokens) == 1 and len(tokens[0]) == wcnf.nv and set(tokens[0]) <= {'0', '1'}:
+            assignment = [i if bit == '1' else -i for i, bit in enumerate(tokens[0], 1)]
+        else:
+            assignment = [int(token) for token in tokens if token != '0']
+        signed = set(assignment)
+        if any(-lit in signed for lit in signed) or any(not any(lit in signed for lit in clause) for clause in wcnf.hard):
+            return -1, assignment, 'INVALID'
+        actual_cost = sum(weight for clause, weight in zip(wcnf.soft, wcnf.wght)
+                          if not any(lit in signed for lit in clause))
+        if cost is not None and cost != actual_cost:
+            return -1, assignment, 'INVALID'
+        return actual_cost, assignment, 'OPTIMAL' if status == 'OPTIMAL' else 'FEASIBLE'
+    finally:
+        os.unlink(wcnf_path)
 
-    print(f"  WCNF file: {wcnf_path}")
-
-    solver_name = os.path.basename(solver_path).lower()
-    cmd = [solver_path]
-    if timeout and timeout > 0:
-        if solver_name == 'maxhs':
-            cmd.append(f"-cpu-lim={int(timeout)}")
-        elif solver_name in ('wmaxcdcl', 'openwbo'):
-            cmd.append(f"-cpu-lim={int(timeout)}")
-    if greedy_cost is not None and greedy_cost >= 0:
-        print(f"  [warm-start] initial upper bound available: {greedy_cost} (not injected as CLI flag)")
-    cmd.append(wcnf_path)
-
-    proc = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=(int(timeout) + 30) if timeout and timeout > 0 else None,
-    )
-
-    # Parse the solver's status line (s ...) from stdout
-    solver_status_line = ''
-    for line in (proc.stdout or '').split('\n'):
-        if line.startswith('s '):
-            solver_status_line = line[2:].strip()
-
-    # Accepted return codes:
-    #   0  — normal exit (no conclusion / UNKNOWN)
-    #   1  — timeout/interrupted for MAXHS and WMAXCDCL (cpu-lim reached)
-    #   10 — SATISFIABLE (suboptimal feasible solution)
-    #   20 — UNSATISFIABLE (hard clauses infeasible)
-    #   30 — OPTIMUM FOUND
-    if proc.returncode not in [0, 1, 10, 20, 30]:
-        stdout_tail = "\n".join((proc.stdout or "").splitlines()[-8:])
-        stderr_tail = "\n".join((proc.stderr or "").splitlines()[-8:])
-        raise RuntimeError(
-            f"External solver failed: {os.path.basename(solver_path)}, "
-            f"rc={proc.returncode}\n"
-            f"[stdout-tail]\n{stdout_tail}\n"
-            f"[stderr-tail]\n{stderr_tail}"
-        )
-
-    # Map MaxSAT solver output to canonical status names used by the
-    # analysis pipeline: OPTIMAL / FEASIBLE / UNSAT / TIMEOUT.
-    if solver_status_line == 'OPTIMUM FOUND' or proc.returncode == 30:
-        solver_status = 'OPTIMAL'
-    elif solver_status_line == 'SATISFIABLE' or proc.returncode == 10:
-        solver_status = 'FEASIBLE'
-    elif solver_status_line == 'UNSATISFIABLE' or proc.returncode == 20:
-        solver_status = 'UNSAT'
-    else:
-        solver_status = 'TIMEOUT'
-
-    cost = -1
-    assignment = []
-
-    for line in proc.stdout.split('\n'):
-        if line.startswith('o '):
-            cost = int(line.split(' ')[1])
-        if line.startswith('v '):
-            assignment_str = line.split(' ')[1:]
-            assignment = [int(v) for v in assignment_str if v and v != '0']
-
-    # If solver timed out but found a feasible upper bound, upgrade to FEASIBLE
-    if solver_status == 'TIMEOUT' and cost >= 0:
-        solver_status = 'FEASIBLE'
-
-    return cost, assignment, solver_status
-
-
-def build_and_solve(problem, encoding, cfg, solver='RC2', collect_timings=True):
+def build_and_solve(problem, encoding, cfg, solver='RC2', collect_timings=True, output_path=None):
     t_start = time.time()
 
     # Build WCNF
@@ -379,29 +334,18 @@ def build_and_solve(problem, encoding, cfg, solver='RC2', collect_timings=True):
         wcnf, name2idx, vpool = build_result
         build_timings = {}
 
-    # Compute phase hints from greedy solution (use preprocessed problem for
-    # consistent variable names/bounds with the encoding)
-    phases = None
-    preprocess_meta = getattr(wcnf, '_preprocess_meta', None)
-    processed_problem = getattr(wcnf, '_processed_problem', problem)
-    if preprocess_meta is not None:
-        greedy_sol = preprocess_meta.get('objective', {}).get('greedy_solution')
-        if greedy_sol:
-            phases = _greedy_to_phases(greedy_sol, processed_problem, encoding, vpool)
+    if output_path is not None:
+        _write_wcnf(wcnf, output_path)
 
-    greedy_cost = _compute_greedy_cost(wcnf, phases) if phases else None
-    lp_bound = getattr(wcnf, '_lp_cost_bound', None)
-    if lp_bound is not None:
-        if greedy_cost is None or lp_bound < greedy_cost:
-            greedy_cost = lp_bound
+    processed_problem = wcnf._processed_problem
 
     # Solve
     t_solve = time.time()
     solver_upper = solver.upper()
     ext_solver_status = None
     if solver_upper == 'RC2':
-        cost, assignment = solve_rc2(wcnf, phases=phases)
-        ext_solver_status = 'OPTIMAL' if cost >= 0 else 'TIMEOUT'
+        cost, assignment = solve_rc2(wcnf, timeout=cfg.rc2_timeout)
+        ext_solver_status = 'TIMEOUT' if assignment is None else ('OPTIMAL' if cost >= 0 else 'UNSAT')
     elif solver_upper in ('MAXHS', 'WMAXCDCL', 'OPENWBO'):
         path_map = {
             'MAXHS': cfg.maxhs_path,
@@ -412,48 +356,23 @@ def build_and_solve(problem, encoding, cfg, solver='RC2', collect_timings=True):
             wcnf,
             cfg.workdir,
             path_map[solver_upper],
-            timeout=getattr(cfg, 'external_solver_timeout', 0),
-            greedy_cost=greedy_cost
+            timeout=getattr(cfg, 'external_solver_timeout', 0)
         )
     else:
         raise ValueError(f"Unsupported solver: {solver}")
     solve_time = time.time() - t_solve
 
-    # Compute objective value from MaxSAT cost
-    total_soft_weight = sum(wcnf.wght) if wcnf.wght else 0
-    neg_offset = getattr(wcnf, '_neg_soft_total', 0)
-    weight_gcd = getattr(wcnf, '_weight_gcd', 1)
-    objective_value = ((total_soft_weight - cost) - neg_offset) * weight_gcd
-
-    # Add constant terms from objective (not encoded)
-    obj_constant = getattr(wcnf, '_objective_constant', 0)
-    objective_value += obj_constant
-
-    # Reverse preprocessing transformations to recover original objective value
-    preprocess_meta = getattr(wcnf, '_preprocess_meta', None)
-    if preprocess_meta is not None:
-        const_shift = preprocess_meta.get('objective', {}).get('constant_shift', 0)
-        sense_flip = preprocess_meta.get('objective', {}).get('sense_flip', False)
-        scale_lcm = preprocess_meta.get('objective', {}).get('scale_lcm', 1)
-        scale_gcd = preprocess_meta.get('objective', {}).get('scale_gcd', 1)
-
-        if scale_lcm > 1 or scale_gcd > 1:
-            from fractions import Fraction
-            scale_frac = Fraction(scale_lcm, scale_gcd)
-            scaled_const = int(Fraction(const_shift) * scale_frac)
-        else:
-            scaled_const = int(const_shift)
-        objective_value += scaled_const
-
-        if sense_flip:
-            objective_value = -objective_value
-
-        if scale_lcm > 1 or scale_gcd > 1:
-            from fractions import Fraction
-            inv_scale = Fraction(scale_gcd, scale_lcm)
-            objective_value = float(Fraction(objective_value) * inv_scale)
-            if objective_value == int(objective_value):
-                objective_value = int(objective_value)
+    total_soft_weight = sum(wcnf.wght)
+    objective_exact = None
+    objective_value = None
+    if cost >= 0 and ext_solver_status in ('OPTIMAL', 'FEASIBLE'):
+        shifted = ((total_soft_weight - cost) - getattr(wcnf, '_neg_soft_total', 0)) * wcnf._weight_gcd
+        meta_obj = (wcnf._preprocess_meta or {}).get('objective', {})
+        objective_exact = Fraction(shifted) * Fraction(meta_obj.get('scale_gcd', 1), meta_obj.get('scale_lcm', 1))
+        objective_exact += meta_obj.get('constant_shift', 0)
+        if meta_obj.get('sense_flip', False):
+            objective_exact = -objective_exact
+        objective_value = int(objective_exact) if objective_exact.denominator == 1 else float(objective_exact)
 
     total_time = time.time() - t_start
 
@@ -469,6 +388,8 @@ def build_and_solve(problem, encoding, cfg, solver='RC2', collect_timings=True):
         'solver': solver,
         'solver_status': ext_solver_status,
         'objective_value': objective_value,
+        'objective_value_exact': str(objective_exact) if objective_exact is not None else None,
+        'processed_problem': processed_problem,
         'maxsat_cost': cost,
         'total_soft_weight': total_soft_weight,
         'num_variables': wcnf.nv,
@@ -477,7 +398,10 @@ def build_and_solve(problem, encoding, cfg, solver='RC2', collect_timings=True):
         'top_weight': wcnf.topw,
         'assignment': assignment,
         'name2idx': name2idx,
-        'vpool': vpool
+        'vpool': vpool,
+        'num_multiplications': getattr(vpool, '_multiplication_count', 0),
+        'multiplication_cache_hits': getattr(vpool, '_multiplication_cache_hits', 0),
+        'decomposition_effective': getattr(vpool, '_multiplication_count', 0) > 0
     }
 
     if collect_timings:
@@ -490,4 +414,21 @@ def build_and_solve(problem, encoding, cfg, solver='RC2', collect_timings=True):
     if hasattr(wcnf, '_preprocess_meta') and wcnf._preprocess_meta is not None:
         result['preprocess_meta'] = wcnf._preprocess_meta
 
+    if ext_solver_status in ('OPTIMAL', 'FEASIBLE'):
+        check_start = time.time()
+        check_result = result
+        if ext_solver_status == 'FEASIBLE':
+            check_result = {**result, 'objective_value': None, 'objective_value_exact': None}
+        valid, report = verify_solution(problem, check_result, encoding)
+        if valid and ext_solver_status == 'FEASIBLE':
+            result['encoded_objective_value_exact'] = result['objective_value_exact']
+            result['objective_value_exact'] = report['computed_objective_exact']
+            result['objective_value'] = report['computed_objective']
+            report['reported_objective'] = result['objective_value']
+        result['verification'] = report
+        result['verified'] = valid
+        if collect_timings:
+            result['timings']['verify'] = time.time() - check_start
+        if not valid:
+            result['solver_status'] = 'INVALID'
     return result

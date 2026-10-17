@@ -3,7 +3,7 @@ import re
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass, field
-from collections import defaultdict
+from collections import defaultdict, deque
 
 try:
     import z3
@@ -42,7 +42,10 @@ class ParseStats:
 
 
 def parse_smt2_file(filepath: str, objective_mode: str = "sum",
-                    verbose: bool = False, default_ub: int = 1000) -> Dict[str, Any]:
+                    verbose: bool = False, default_ub: int = 1000,
+                    strict: bool = True) -> Dict[str, Any]:
+    if objective_mode not in ('sum', 'first', 'zero'):
+        raise ValueError(f'unsupported SMT objective mode: {objective_mode}')
     path = Path(filepath)
     stats = ParseStats()
 
@@ -67,6 +70,7 @@ def parse_smt2_file(filepath: str, objective_mode: str = "sum",
 
     # 2. Use Z3 to extract bounds and constraints
     constraints = []
+    assertions = []
     try:
         assertions = z3.parse_smt2_file(filepath)
         stats.total_assertions = len(assertions)
@@ -76,16 +80,42 @@ def parse_smt2_file(filepath: str, objective_mode: str = "sum",
                                                        variables=variables)
         constraints.extend(all_constraints)
 
+    except TimeoutError:
+        raise
     except Exception as e:
+        if strict:
+            raise ValueError(f"Z3 could not parse {path.name}: {e}") from e
+        stats.skipped_constraints += 1
+        stats.skipped_reasons["SMT parse failure"] += 1
         if verbose:
             print(f"Warning: Z3 parse failed: {e}")
 
+    if strict and stats.skipped_constraints:
+        reasons = ", ".join(
+            f"{reason}={count}" for reason, count in sorted(stats.skipped_reasons.items())
+        )
+        raise ValueError(
+            f"incomplete SMT translation for {path.name}: "
+            f"{stats.skipped_constraints} unsupported constraint(s) ({reasons})"
+        )
+
     # 3. Set default bounds for variables without inferred bounds
+    defaulted_bounds = []
     for name in int_var_names:
         if variables[name]['lb'] is None:
+            defaulted_bounds.append(f"{name}:lb")
             variables[name]['lb'] = 0
         if variables[name]['ub'] is None:
+            defaulted_bounds.append(f"{name}:ub")
             variables[name]['ub'] = default_ub
+
+    if strict and defaulted_bounds:
+        preview = ", ".join(defaulted_bounds[:8])
+        if len(defaulted_bounds) > 8:
+            preview += f", ... (+{len(defaulted_bounds) - 8})"
+        raise ValueError(
+            f"SMT variables require artificial bounds in {path.name}: {preview}"
+        )
 
     # 4. Build objective function
     objective = _build_objective(int_var_names, objective_mode)
@@ -103,17 +133,25 @@ def parse_smt2_file(filepath: str, objective_mode: str = "sum",
         name_map[name] = safe_name
         normalized_vars[safe_name] = variables[name]
 
-    normalized_constraints = []
-    for c in constraints:
+    def _normalize_atom(atom):
         new_terms = []
-        for term in c['terms']:
+        for term in atom['terms']:
             new_vars = {name_map.get(v, v): exp for v, exp in term['vars'].items()}
             new_terms.append({'c': term['c'], 'vars': new_vars})
-        normalized_constraints.append({
-            'terms': new_terms,
-            'rel': c['rel'],
-            'rhs': c['rhs']
-        })
+        return {'terms': new_terms, 'rel': atom['rel'], 'rhs': atom['rhs']}
+
+    normalized_constraints = []
+    for c in constraints:
+        if c.get('type') == 'disjunction':
+            normalized_constraints.append({
+                'type': 'disjunction',
+                'disjuncts': [
+                    [_normalize_atom(atom) for atom in branch]
+                    for branch in c.get('disjuncts', [])
+                ]
+            })
+        else:
+            normalized_constraints.append(_normalize_atom(c))
 
     normalized_obj_terms = []
     for term in objective['terms']:
@@ -136,7 +174,10 @@ def parse_smt2_file(filepath: str, objective_mode: str = "sum",
             'polynomial_constraints': stats.polynomial_constraints,
             'equality_definitions': stats.equality_definitions,
             'max_degree': stats.max_degree,
-            'skipped': stats.skipped_constraints
+            'skipped': stats.skipped_constraints,
+            'skipped_reasons': dict(stats.skipped_reasons),
+            'defaulted_bounds': defaulted_bounds,
+            'strict': strict
         }
     }
 
@@ -144,14 +185,15 @@ def parse_smt2_file(filepath: str, objective_mode: str = "sum",
         print(f"\n=== Parse Stats for {path.name} ===")
         print(stats.summary())
 
+    problem["_smt_assertions"] = assertions
     return problem
 
 
 def _extract_bounds_z3(assertions, variables: Dict, int_var_names: List[str], stats: ParseStats):
-    queue = list(assertions)
+    queue = deque(assertions)
 
     while queue:
-        expr = queue.pop(0)
+        expr = queue.popleft()
 
         if z3.is_and(expr):
             queue.extend(expr.children())
@@ -161,7 +203,7 @@ def _extract_bounds_z3(assertions, variables: Dict, int_var_names: List[str], st
             continue
 
         kind = expr.decl().kind()
-        lhs, rhs = expr.children()
+        lhs, rhs = (z3.simplify(a) for a in expr.children())
 
         bound_extracted = False
 
@@ -228,221 +270,167 @@ def _update_bound(variables: Dict, var_name: str, kind: int, val: int, is_rhs_co
 
 def _extract_all_constraints_z3(assertions, int_var_names: List[str], stats: ParseStats,
                                  variables: Dict = None) -> List[Dict]:
+    """Translate the top-level conjunction into polynomial atoms and exact DNF.
+
+    Boolean structure is preserved.  In particular, no unselected branch is
+    allowed to constrain the integer variables, which was the semantic defect
+    in the selector-based implementation being replaced here.
+    """
     constraints = []
-    queue = list(assertions)
+    queue = deque(assertions)
 
     while queue:
-        expr = queue.pop(0)
-
+        expr = queue.popleft()
         if z3.is_and(expr):
             queue.extend(expr.children())
             stats.and_constraints += 1
             continue
 
         if z3.is_or(expr):
-            or_result = _handle_or_constraint(expr, int_var_names, stats, variables)
-            if or_result is not None:
-                constraints.extend(or_result)
-                stats.or_constraints += 1
-                continue
             stats.or_constraints += 1
-            stats.skipped_reasons["OR constraint (complex)"] += 1
-            stats.skipped_constraints += 1
+
+        if z3.is_bool(expr):
+            dnf = _boolean_to_dnf(expr, int_var_names, stats)
+            if dnf is None:
+                continue
+            if not dnf:
+                constraints.append({'terms': [], 'rel': '==', 'rhs': 1})
+            elif len(dnf) == 1:
+                constraints.extend(dnf[0])
+            else:
+                constraints.append({'type': 'disjunction', 'disjuncts': dnf})
+            _record_dnf_degree(dnf, stats)
             continue
 
-        if z3.is_app(expr) and expr.decl().kind() == z3.Z3_OP_NOT:
-            not_result = _handle_not_constraint(expr, int_var_names, stats, variables)
-            if not_result is not None:
-                constraints.extend(not_result)
-                continue
-
         parsed = _parse_polynomial_constraint_general(expr, int_var_names, stats)
-        if parsed:
+        if parsed is not None:
             constraints.append(parsed)
-            for term in parsed['terms']:
-                degree = sum(term['vars'].values()) if term['vars'] else 0
-                stats.max_degree = max(stats.max_degree, degree)
+            _record_atom_degree(parsed, stats)
 
     return constraints
 
 
-_not_and_counter = [0]
+_MAX_DNF_BRANCHES = 4096
 
 
-def _handle_not_constraint(expr, int_var_names: List[str], stats: ParseStats,
-                           variables: Dict = None) -> Optional[List[Dict]]:
-    """Handle NOT(AND(C_1, ..., C_n)) = OR(neg C_1, ..., neg C_n).
+def _record_atom_degree(atom: Dict, stats: ParseStats) -> None:
+    for term in atom.get('terms', []):
+        degree = sum(term['vars'].values()) if term.get('vars') else 0
+        stats.max_degree = max(stats.max_degree, degree)
 
-    For equalities C_j: f_j = 0 with companion f_j >= 0, the negation
-    neg C_j simplifies to f_j >= 1.  We introduce auxiliary binary variables
-    delta_j and encode:
-      f_j >= delta_j  (i.e.  f_j - delta_j >= 0)   for each j
-      delta_1 + ... + delta_n >= 1                   (at least one strict)
-    """
-    child = expr.children()[0]
-    if not z3.is_and(child):
+
+def _record_dnf_degree(dnf: List[List[Dict]], stats: ParseStats) -> None:
+    for branch in dnf:
+        for atom in branch:
+            _record_atom_degree(atom, stats)
+
+
+def _negate_constraint(constraint: Dict) -> List[List[Dict]]:
+    """Return exact integer DNF for the negation of one polynomial atom."""
+    terms = constraint['terms']
+    rel = constraint['rel']
+    rhs = constraint['rhs']
+
+    if rel == '<=':
+        return [[{'terms': terms, 'rel': '>=', 'rhs': rhs + 1}]]
+    if rel == '<':
+        return [[{'terms': terms, 'rel': '>=', 'rhs': rhs}]]
+    if rel == '>=':
+        return [[{'terms': terms, 'rel': '<=', 'rhs': rhs - 1}]]
+    if rel == '>':
+        return [[{'terms': terms, 'rel': '<=', 'rhs': rhs}]]
+    if rel in ('=', '=='):
+        return [
+            [{'terms': terms, 'rel': '<=', 'rhs': rhs - 1}],
+            [{'terms': terms, 'rel': '>=', 'rhs': rhs + 1}],
+        ]
+    raise ValueError(f"cannot negate relation {rel}")
+
+
+def _dnf_and(left: List[List[Dict]], right: List[List[Dict]],
+             stats: ParseStats) -> Optional[List[List[Dict]]]:
+    if not left or not right:
+        return []
+    if len(left) * len(right) > _MAX_DNF_BRANCHES:
+        stats.skipped_reasons["Boolean DNF exceeds branch limit"] += 1
+        stats.skipped_constraints += 1
         return None
+    return [a + b for a in left for b in right]
 
-    sub_exprs = child.children()
-    parsed_subs = []
-    for se in sub_exprs:
-        p = _parse_polynomial_constraint_general(se, int_var_names, stats)
-        if p is None:
+
+def _boolean_to_dnf(expr, int_var_names: List[str], stats: ParseStats,
+                    negated: bool = False) -> Optional[List[List[Dict]]]:
+    """Convert supported Boolean structure to exact DNF over polynomial atoms."""
+    if z3.is_true(expr):
+        return [] if negated else [[]]
+    if z3.is_false(expr):
+        return [[]] if negated else []
+    if z3.is_const(expr) and expr.decl().kind() == z3.Z3_OP_UNINTERPRETED and z3.is_bool(expr):
+        return [[{'terms': [{'c': 1, 'vars': {_get_var_name(expr): 1}}],
+                  'rel': '==', 'rhs': 0 if negated else 1}]]
+    if z3.is_eq(expr) and all(z3.is_bool(child) for child in expr.children()):
+        left, right = expr.children()
+        equivalent = z3.Or(z3.And(left, right), z3.And(z3.Not(left), z3.Not(right)))
+        return _boolean_to_dnf(equivalent, int_var_names, stats, negated)
+    if z3.is_not(expr):
+        return _boolean_to_dnf(expr.children()[0], int_var_names, stats, not negated)
+
+    if z3.is_implies(expr):
+        lhs, rhs = expr.children()
+        if negated:
+            left = _boolean_to_dnf(lhs, int_var_names, stats, False)
+            right = _boolean_to_dnf(rhs, int_var_names, stats, True)
+            if left is None or right is None:
+                return None
+            return _dnf_and(left, right, stats)
+        left = _boolean_to_dnf(lhs, int_var_names, stats, True)
+        right = _boolean_to_dnf(rhs, int_var_names, stats, False)
+        if left is None or right is None:
             return None
-        parsed_subs.append(p)
+        result = left + right
+        if len(result) > _MAX_DNF_BRANCHES:
+            stats.skipped_reasons["Boolean DNF exceeds branch limit"] += 1
+            stats.skipped_constraints += 1
+            return None
+        return result
 
-    if not parsed_subs:
+    if z3.is_and(expr) or z3.is_or(expr):
+        is_and = z3.is_and(expr)
+        effective_and = is_and != negated
+        children = list(expr.children())
+        if effective_and:
+            result: List[List[Dict]] = [[]]
+            for child in children:
+                child_dnf = _boolean_to_dnf(child, int_var_names, stats, negated)
+                if child_dnf is None:
+                    return None
+                result = _dnf_and(result, child_dnf, stats)
+                if result is None:
+                    return None
+            return result
+
+        result = []
+        for child in children:
+            child_dnf = _boolean_to_dnf(child, int_var_names, stats, negated)
+            if child_dnf is None:
+                return None
+            result.extend(child_dnf)
+            if len(result) > _MAX_DNF_BRANCHES:
+                stats.skipped_reasons["Boolean DNF exceeds branch limit"] += 1
+                stats.skipped_constraints += 1
+                return None
+        return result
+
+    atom = _parse_polynomial_constraint_general(expr, int_var_names, stats)
+    if atom is None:
         return None
-
-    batch_id = _not_and_counter[0]
-    _not_and_counter[0] += 1
-
-    result_constraints = []
-    delta_names = []
-
-    for j, sub in enumerate(parsed_subs):
-        delta_name = f"__delta_{batch_id}_{j}"
-        delta_names.append(delta_name)
-        if variables is not None:
-            variables[delta_name] = {'lb': 0, 'ub': 1}
-
-        if sub['rel'] in ('==', '='):
-            new_terms = [t.copy() for t in sub['terms']]
-            new_terms.append({'c': -1.0, 'vars': {delta_name: 1}})
-            result_constraints.append({
-                'terms': new_terms,
-                'rel': '>=',
-                'rhs': sub['rhs']
-            })
-        elif sub['rel'] == '>=':
-            neg_terms = [{'c': -t['c'], 'vars': dict(t['vars'])} for t in sub['terms']]
-            neg_terms.append({'c': -1.0, 'vars': {delta_name: 1}})
-            result_constraints.append({
-                'terms': neg_terms,
-                'rel': '>=',
-                'rhs': -sub['rhs']
-            })
-        elif sub['rel'] == '<=':
-            new_terms = [t.copy() for t in sub['terms']]
-            new_terms.append({'c': -1.0, 'vars': {delta_name: 1}})
-            result_constraints.append({
-                'terms': new_terms,
-                'rel': '>=',
-                'rhs': sub['rhs']
-            })
-        else:
-            return None
-
-    alo_terms = [{'c': 1.0, 'vars': {dn: 1}} for dn in delta_names]
-    result_constraints.append({
-        'terms': alo_terms,
-        'rel': '>=',
-        'rhs': 1
-    })
-
-    stats.polynomial_constraints += len(result_constraints)
-    return result_constraints
-
-
-def _handle_or_constraint(expr, int_var_names: List[str], stats: ParseStats,
-                          variables: Dict = None) -> Optional[List[Dict]]:
-    children = expr.children()
-
-    flat_subs = []
-    for ch in children:
-        if z3.is_not(ch):
-            inner = ch.children()[0]
-            p = _parse_polynomial_constraint_general(inner, int_var_names, stats)
-            if p is None:
-                return None
-            if p['rel'] in ('==', '='):
-                flat_subs.append(('neq', p))
-            elif p['rel'] == '>=':
-                flat_subs.append(('lt', p))
-            elif p['rel'] == '<=':
-                flat_subs.append(('gt', p))
-            else:
-                return None
-        else:
-            p = _parse_polynomial_constraint_general(ch, int_var_names, stats)
-            if p is None:
-                return None
-            flat_subs.append(('pos', p))
-
-    if not flat_subs:
-        return None
-
-    batch_id = _not_and_counter[0]
-    _not_and_counter[0] += 1
-
-    result_constraints = []
-    sel_names = []
-
-    for j, (kind, sub) in enumerate(flat_subs):
-        sel_name = f"__sel_{batch_id}_{j}"
-        sel_names.append(sel_name)
-        if variables is not None:
-            variables[sel_name] = {'lb': 0, 'ub': 1}
-
-        if kind == 'pos':
-            if sub['rel'] in ('>=', '>'):
-                new_terms = [t.copy() for t in sub['terms']]
-                new_terms.append({'c': -1.0, 'vars': {sel_name: 1}})
-                result_constraints.append({
-                    'terms': new_terms,
-                    'rel': '>=',
-                    'rhs': sub['rhs'] - 1
-                })
-            elif sub['rel'] in ('<=', '<'):
-                neg_terms = [{'c': -t['c'], 'vars': dict(t['vars'])} for t in sub['terms']]
-                neg_terms.append({'c': -1.0, 'vars': {sel_name: 1}})
-                result_constraints.append({
-                    'terms': neg_terms,
-                    'rel': '>=',
-                    'rhs': -sub['rhs'] - 1
-                })
-            else:
-                return None
-        elif kind == 'neq':
-            new_terms = [t.copy() for t in sub['terms']]
-            new_terms.append({'c': -1.0, 'vars': {sel_name: 1}})
-            result_constraints.append({
-                'terms': new_terms,
-                'rel': '>=',
-                'rhs': sub['rhs']
-            })
-        elif kind == 'lt':
-            neg_terms = [{'c': -t['c'], 'vars': dict(t['vars'])} for t in sub['terms']]
-            neg_terms.append({'c': -1.0, 'vars': {sel_name: 1}})
-            result_constraints.append({
-                'terms': neg_terms,
-                'rel': '>=',
-                'rhs': -sub['rhs']
-            })
-        elif kind == 'gt':
-            new_terms = [t.copy() for t in sub['terms']]
-            new_terms.append({'c': -1.0, 'vars': {sel_name: 1}})
-            result_constraints.append({
-                'terms': new_terms,
-                'rel': '>=',
-                'rhs': sub['rhs']
-            })
-        else:
-            return None
-
-    alo_terms = [{'c': 1.0, 'vars': {sn: 1}} for sn in sel_names]
-    result_constraints.append({
-        'terms': alo_terms,
-        'rel': '>=',
-        'rhs': 1
-    })
-
-    stats.polynomial_constraints += len(result_constraints)
-    return result_constraints
+    return _negate_constraint(atom) if negated else [[atom]]
 
 
 def _parse_polynomial_constraint_general(expr, int_var_names: List[str], stats: ParseStats) -> Optional[Dict]:
     if not z3.is_app(expr):
+        stats.skipped_constraints += 1
+        stats.skipped_reasons["unsupported non-atomic assertion"] += 1
         return None
 
     kind = expr.decl().kind()
@@ -469,8 +457,9 @@ def _parse_polynomial_constraint_general(expr, int_var_names: List[str], stats: 
 
     lhs, rhs = expr.children()
 
-    lhs_terms = _parse_polynomial_expr(lhs, int_var_names)
-    rhs_terms = _parse_polynomial_expr(rhs, int_var_names)
+    polynomial_cache = {}
+    lhs_terms = _parse_polynomial_expr(lhs, int_var_names, polynomial_cache)
+    rhs_terms = _parse_polynomial_expr(rhs, int_var_names, polynomial_cache)
 
     if lhs_terms is None:
         stats.skipped_reasons["LHS parse failed"] += 1
@@ -482,30 +471,12 @@ def _parse_polynomial_constraint_general(expr, int_var_names: List[str], stats: 
         stats.skipped_constraints += 1
         return None
 
-    # Standard form: lhs - rhs rel 0 (move all terms to left, constants to right)
-    combined_terms = []
-    rhs_constant = 0
-
-    for term in lhs_terms:
-        if not term['vars']:
-            rhs_constant -= term['c']
-        else:
-            combined_terms.append(term.copy())
-
-    for term in rhs_terms:
-        if not term['vars']:
-            rhs_constant += term['c']
-        else:
-            found = False
-            for ct in combined_terms:
-                if ct['vars'] == term['vars']:
-                    ct['c'] -= term['c']
-                    found = True
-                    break
-            if not found:
-                combined_terms.append({'c': -term['c'], 'vars': term['vars'].copy()})
-
-    combined_terms = [t for t in combined_terms if abs(t['c']) > 1e-10]
+    # Merge lhs - rhs by monomial key. A linear search for every RHS term
+    # becomes quadratic on the bundled Calypto expanded polynomial.
+    combined = _merge_like_terms(lhs_terms + [
+        {'c': -term['c'], 'vars': term['vars']} for term in rhs_terms])
+    rhs_constant = -sum(term['c'] for term in combined if not term['vars'])
+    combined_terms = [term for term in combined if term['vars'] and term['c']]
 
     rel_map = {
         z3.Z3_OP_LE: '<=',
@@ -528,16 +499,30 @@ def _parse_polynomial_constraint_general(expr, int_var_names: List[str], stats: 
     }
 
 
-def _parse_polynomial_expr(expr, int_var_names: List[str]) -> Optional[List[Dict]]:
+def _parse_polynomial_expr(expr, int_var_names: List[str], cache=None) -> Optional[List[Dict]]:
+    # Z3 expressions are DAGs: SMT let bindings can reuse a subtree many times.
+    # Cache immutable polynomials per atom; callers receive fresh mutable terms.
+    if cache is None:
+        cache = {}
+    key = expr.get_id()
+    if key not in cache:
+        result = _parse_polynomial_expr_uncached(expr, int_var_names, cache)
+        cache[key] = None if result is None else tuple(
+            (term['c'], tuple(term['vars'].items())) for term in result)
+    stored = cache[key]
+    return None if stored is None else [{'c': c, 'vars': dict(powers)} for c, powers in stored]
+
+
+def _parse_polynomial_expr_uncached(expr, int_var_names: List[str], cache) -> Optional[List[Dict]]:
     # Integer constant
     if z3.is_int_value(expr):
         val = expr.as_long()
-        return [{'c': float(val), 'vars': {}}]
+        return [{'c': val, 'vars': {}}]
 
     # Integer variable
     if _is_int_var(expr):
         name = _get_var_name(expr)
-        return [{'c': 1.0, 'vars': {name: 1}}]
+        return [{'c': 1, 'vars': {name: 1}}]
 
     if not z3.is_app(expr):
         return None
@@ -549,7 +534,7 @@ def _parse_polynomial_expr(expr, int_var_names: List[str]) -> Optional[List[Dict
     if kind == z3.Z3_OP_ADD:
         result = []
         for child in children:
-            child_terms = _parse_polynomial_expr(child, int_var_names)
+            child_terms = _parse_polynomial_expr(child, int_var_names, cache)
             if child_terms is None:
                 return None
             result.extend(child_terms)
@@ -558,15 +543,15 @@ def _parse_polynomial_expr(expr, int_var_names: List[str]) -> Optional[List[Dict
     # Subtraction
     if kind == z3.Z3_OP_SUB:
         if len(children) == 1:
-            terms = _parse_polynomial_expr(children[0], int_var_names)
+            terms = _parse_polynomial_expr(children[0], int_var_names, cache)
             if terms is None:
                 return None
             for t in terms:
                 t['c'] = -t['c']
             return terms
         elif len(children) == 2:
-            left_terms = _parse_polynomial_expr(children[0], int_var_names)
-            right_terms = _parse_polynomial_expr(children[1], int_var_names)
+            left_terms = _parse_polynomial_expr(children[0], int_var_names, cache)
+            right_terms = _parse_polynomial_expr(children[1], int_var_names, cache)
             if left_terms is None or right_terms is None:
                 return None
             for t in right_terms:
@@ -578,7 +563,7 @@ def _parse_polynomial_expr(expr, int_var_names: List[str]) -> Optional[List[Dict
     if kind == z3.Z3_OP_UMINUS:
         if len(children) != 1:
             return None
-        terms = _parse_polynomial_expr(children[0], int_var_names)
+        terms = _parse_polynomial_expr(children[0], int_var_names, cache)
         if terms is None:
             return None
         for t in terms:
@@ -587,7 +572,7 @@ def _parse_polynomial_expr(expr, int_var_names: List[str]) -> Optional[List[Dict
 
     # Multiplication
     if kind == z3.Z3_OP_MUL:
-        return _parse_multiplication(children, int_var_names)
+        return _parse_multiplication(children, int_var_names, cache)
 
     # ITE (if-then-else) - not supported
     if kind == z3.Z3_OP_ITE:
@@ -596,8 +581,8 @@ def _parse_polynomial_expr(expr, int_var_names: List[str]) -> Optional[List[Dict
     return None
 
 
-def _parse_multiplication(children, int_var_names: List[str]) -> Optional[List[Dict]]:
-    coeff = 1.0
+def _parse_multiplication(children, int_var_names: List[str], cache=None) -> Optional[List[Dict]]:
+    coeff = 1
     combined_vars = {}
     need_distribution = False
 
@@ -615,10 +600,10 @@ def _parse_multiplication(children, int_var_names: List[str]) -> Optional[List[D
         return [{'c': coeff, 'vars': combined_vars}]
 
     # Distributive expansion: (a+b)*(c+d) = a*c + a*d + b*c + b*d
-    result_terms = [{'c': 1.0, 'vars': {}}]
+    result_terms = [{'c': 1, 'vars': {}}]
 
     for child in children:
-        child_terms = _parse_polynomial_expr(child, int_var_names)
+        child_terms = _parse_polynomial_expr(child, int_var_names, cache)
         if child_terms is None:
             return None
 
@@ -632,7 +617,7 @@ def _parse_multiplication(children, int_var_names: List[str]) -> Optional[List[D
                 for v, e in ct['vars'].items():
                     new_term['vars'][v] = new_term['vars'].get(v, 0) + e
                 new_result.append(new_term)
-        result_terms = new_result
+        result_terms = _merge_like_terms(new_result)
 
     return _merge_like_terms(result_terms)
 
@@ -647,8 +632,8 @@ def _merge_like_terms(terms: List[Dict]) -> List[Dict]:
         else:
             merged[key] = {'c': term['c'], 'vars': dict(term['vars'])}
 
-    result = [t for t in merged.values() if abs(t['c']) > 1e-10]
-    return result if result else [{'c': 0.0, 'vars': {}}]
+    result = [t for t in merged.values() if t['c'] != 0]
+    return result if result else [{'c': 0, 'vars': {}}]
 
 
 def _build_objective(int_var_names: List[str], mode: str) -> Dict:
@@ -658,11 +643,9 @@ def _build_objective(int_var_names: List[str], mode: str) -> Dict:
     if mode == "first" and int_var_names:
         return {
             'sense': 'max',
-            'terms': [{'c': 1.0, 'vars': {int_var_names[0]: 1}}]
+            'terms': [{'c': 1, 'vars': {int_var_names[0]: 1}}]
         }
 
     # Default: maximize sum of all variables
-    terms = [{'c': 1.0, 'vars': {name: 1}} for name in int_var_names]
+    terms = [{'c': 1, 'vars': {name: 1}} for name in int_var_names]
     return {'sense': 'max', 'terms': terms}
-
-

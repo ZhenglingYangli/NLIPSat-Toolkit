@@ -7,6 +7,7 @@ This script is intended for SMT decision benchmarks:
 
 import argparse
 import json
+from fractions import Fraction
 import os
 import signal
 import sys
@@ -19,6 +20,7 @@ from pysat.solvers import Solver
 from solver.solve import build_wcnf, EncodingTimeoutError
 from solver.config import EncodingConfig
 from encoders.onehot import _EncodingTimeout
+from tools.verify import verify_solution, format_verification_report
 
 
 def _timeout_handler(name, encoding, sat_solver, start_time):
@@ -42,7 +44,7 @@ def load_problem_for_decision(input_path):
         return parse_smt2_file(input_path, objective_mode="zero")
     if input_path.endswith(".json"):
         with open(input_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            return json.load(f, parse_float=Fraction)
     if input_path.endswith(".qplib"):
         from tools.qplib_parser import parse_qplib_file
         return parse_qplib_file(input_path)
@@ -106,7 +108,7 @@ def main():
     cfg.external_solver_timeout = 0
 
     try:
-        wcnf, _, timings, _ = build_wcnf(problem, args.encoding, cfg, collect_timings=True)
+        wcnf, name2idx, timings, vpool = build_wcnf(problem, args.encoding, cfg, collect_timings=True)
     except (EncodingTimeoutError, _EncodingTimeout):
         elapsed = time.time() - t_start
         print(
@@ -146,13 +148,25 @@ def main():
     try:
         with Solver(name=backend, bootstrap_with=wcnf.hard) as sat_solver:
             sat_res = sat_solver.solve()
+            model = sat_solver.get_model() if sat_res else None
         status = "SAT" if sat_res else "UNSAT"
     except Exception as e:
         status = "ERROR"
         print(f"Error: SAT backend failed ({backend}) - {e}", file=sys.stderr)
     time_solve = time.time() - t_solve0
 
-    elapsed = time.time() - t_start
+    time_verify = 0.0
+    if status == 'SAT':
+        check_start = time.time()
+        valid, report = verify_solution(problem, {
+            'assignment': model, 'name2idx': name2idx, 'vpool': vpool,
+            'processed_problem': wcnf._processed_problem,
+            'preprocess_meta': wcnf._preprocess_meta}, args.encoding)
+        time_verify = time.time() - check_start
+        print(format_verification_report(report))
+        if not valid:
+            status = 'INVALID'
+    elapsed = time.time() - t_start - time_verify
     enc_str = args.encoding + ("+DECOMP" if cfg.use_decomposition else "")
     print(
         f">>> Benchmark {problem_name} "
@@ -163,10 +177,10 @@ def main():
         f"Vars {wcnf.nv} Hard {len(wcnf.hard)} Soft {len(wcnf.soft)} TopW {wcnf.topw} "
         f"TimeRead {time_read:.3f} "
         f"TimeEncode {timings.get('build_total', 0.0):.3f} "
-        f"TimeSolve {time_solve:.3f} "
+        f"TimeSolve {time_solve:.3f} TimeVerify {time_verify:.3f} "
         f"TimeTotal {elapsed:.3f}"
     )
-    return 0
+    return 1 if status in ('ERROR', 'INVALID') else 0
 
 
 if __name__ == "__main__":

@@ -1,227 +1,156 @@
-#!/usr/bin/env python3
-
-import math
-from typing import Dict, List, Tuple, Any, Optional
+"""Check decoded witnesses in the original, unpreprocessed problem."""
+from fractions import Fraction
 
 
-def decode_assignment_oh(assignment: List[int], name2idx: Dict[str, int],
-                         problem: Dict[str, Any]) -> Dict[str, int]:
-    var_values = {}
-    for var_name, meta in problem.get('variables', {}).items():
-        q = name2idx[var_name]
-        lb = int(meta.get('lb', 0))
-        var_values[var_name] = lb
-    return var_values
+def number(value):
+    return value if isinstance(value, Fraction) else Fraction(str(value))
 
 
-def decode_assignment_una(assignment: List[int], name2idx: Dict[str, int],
-                          problem: Dict[str, Any]) -> Dict[str, int]:
-    var_values = {}
-    for var_name, meta in problem.get('variables', {}).items():
-        q = name2idx[var_name]
-        lb = int(meta.get('lb', 0))
-        var_values[var_name] = lb
-    return var_values
-
-
-def decode_assignment_bin(assignment: List[int], name2idx: Dict[str, int],
-                          problem: Dict[str, Any]) -> Dict[str, int]:
-    var_values = {}
-    for var_name, meta in problem.get('variables', {}).items():
-        q = name2idx[var_name]
-        lb = int(meta.get('lb', 0))
-        var_values[var_name] = lb
-    return var_values
-
-
-def decode_assignment(assignment: List[int], encoding: str,
-                      name2idx: Dict[str, int], problem: Dict[str, Any],
-                      vpool=None) -> Dict[str, int]:
-    if vpool is not None:
-        return decode_assignment_with_vpool(assignment, encoding, name2idx, problem, vpool)
-
-    if encoding == 'OH':
-        return decode_assignment_oh(assignment, name2idx, problem)
-    elif encoding == 'UNA':
-        return decode_assignment_una(assignment, name2idx, problem)
-    elif encoding == 'BIN':
-        return decode_assignment_bin(assignment, name2idx, problem)
-    else:
-        raise ValueError(f"Unsupported encoding: {encoding}")
-
-
-def decode_assignment_with_vpool(assignment: List[int], encoding: str,
-                                  name2idx: Dict[str, int], problem: Dict[str, Any],
-                                  vpool) -> Dict[str, int]:
-    var_values = {}
-    true_vars = set(lit for lit in assignment if lit > 0)
-
-    for var_name, meta in problem.get('variables', {}).items():
-        q = name2idx[var_name]
-        ub = int(meta.get('ub', 0))
-        lb = int(meta.get('lb', 0))
-
+def decode_assignment(assignment, encoding, name2idx, problem, vpool=None):
+    if vpool is None:
+        raise ValueError('variable pool is required to decode a SAT model')
+    if assignment is None:
+        raise ValueError('no SAT model returned')
+    signed = set(assignment)
+    if any(-lit in signed for lit in signed):
+        raise ValueError('contradictory SAT literals')
+    values = {}
+    for name, info in problem.get('variables', {}).items():
+        q = name2idx[name]
+        lb, ub = int(info['lb']), int(info['ub'])
+        width = ub - lb
+        def selected(r):
+            return vpool.obj2id.get(f'x_{q}@{r}') in signed
         if encoding == 'OH':
-            found = False
-            for r in range(ub + 1):
-                var_key = f'x_{q}@{r}'
-                var_id = vpool.obj2id.get(var_key)
-                if var_id is not None and var_id in true_vars:
-                    var_values[var_name] = lb + r
-                    found = True
-                    break
-            if not found:
-                var_values[var_name] = lb
-
+            choices = [r for r in range(width + 1) if selected(r)]
+            if len(choices) != 1:
+                raise ValueError(f'{name}: expected exactly one selected value')
+            value = choices[0]
         elif encoding == 'UNA':
-            max_r = 0
-            for r in range(1, ub + 1):
-                var_key = f'x_{q}@{r}'
-                var_id = vpool.obj2id.get(var_key)
-                if var_id is not None and var_id in true_vars:
-                    max_r = r
-            var_values[var_name] = lb + max_r
-
+            bits = [selected(r) for r in range(1, width + 1)]
+            value = sum(bits)
+            if bits != [r < value for r in range(width)]:
+                raise ValueError(f'{name}: non-monotone unary model')
         elif encoding == 'BIN':
-            num_bits = math.ceil(math.log2(ub + 1)) if ub > 0 else 1
-            val = 0
-            for r in range(num_bits):
-                var_key = f'x_{q}@{r}'
-                var_id = vpool.obj2id.get(var_key)
-                if var_id is not None and var_id in true_vars:
-                    val += (1 << r)
-            var_values[var_name] = lb + val
-
-    return var_values
+            value = sum(1 << r for r in range(max(1, width.bit_length())) if selected(r))
+        else:
+            raise ValueError(f'unsupported encoding: {encoding}')
+        if not 0 <= value <= width:
+            raise ValueError(f'{name}: encoded value outside its domain')
+        values[name] = lb + value
+    return values
 
 
-def evaluate_term(term: Dict[str, Any], var_values: Dict[str, int]) -> int:
-    c = int(term.get('c', 1))
-    result = c
-    for var_name, power in term.get('vars', {}).items():
-        val = var_values.get(var_name, 0)
-        result *= (val ** int(power))
+decode_assignment_with_vpool = decode_assignment
+
+
+def evaluate_term(term, values):
+    result = number(term.get('c', 1))
+    for name, power in term.get('vars', {}).items():
+        if power:
+            result *= values[name] ** int(power)
     return result
 
 
-def evaluate_polynomial(terms: List[Dict[str, Any]], var_values: Dict[str, int]) -> int:
-    return sum(evaluate_term(term, var_values) for term in terms)
+def evaluate_polynomial(terms, values):
+    return sum((evaluate_term(t, values) for t in terms), Fraction(0))
 
 
-def check_constraint(constraint: Dict[str, Any], var_values: Dict[str, int]) -> Tuple[bool, str]:
-    terms = constraint.get('terms', [])
-    sense = constraint.get('sense', '<=')
-    rhs = int(constraint.get('rhs', 0))
-
-    lhs = evaluate_polynomial(terms, var_values)
-
-    if sense == '<=':
-        satisfied = (lhs <= rhs)
-        desc = f"{lhs} <= {rhs}"
-    elif sense == '>=':
-        satisfied = (lhs >= rhs)
-        desc = f"{lhs} >= {rhs}"
-    elif sense == '=' or sense == '==':
-        satisfied = (lhs == rhs)
-        desc = f"{lhs} == {rhs}"
-    else:
-        satisfied = False
-        desc = f"Unknown constraint type: {sense}"
-
-    return satisfied, desc
+def check_constraint(constraint, values):
+    if constraint.get('type') == 'disjunction':
+        branches = [all(check_constraint(a, values)[0] for a in branch)
+                    for branch in constraint.get('disjuncts', [])]
+        return any(branches), f'disjunction: {branches}'
+    lhs = evaluate_polynomial(constraint.get('terms', constraint.get('lhs', [])), values)
+    rhs = number(constraint.get('rhs', 0))
+    rel = constraint.get('rel', constraint.get('sense', '<='))
+    outcomes = {'<=': lhs <= rhs, '<': lhs < rhs, '>=': lhs >= rhs,
+                '>': lhs > rhs, '=': lhs == rhs, '==': lhs == rhs}
+    if rel not in outcomes:
+        raise ValueError(f'unsupported relation: {rel}')
+    return outcomes[rel], f'{lhs} {rel} {rhs}'
 
 
-def verify_solution(problem: Dict[str, Any], result: Dict[str, Any],
-                    encoding: str, vpool=None) -> Tuple[bool, Dict[str, Any]]:
-    report = {
-        'valid': True,
-        'errors': [],
-        'warnings': [],
-        'var_values': {},
-        'constraint_checks': [],
-        'computed_objective': None,
-        'reported_objective': result.get('objective_value')
-    }
+def check_original_smt(problem, values):
+    """Substitute the witness into original Z3 ASTs, independently of the IR."""
+    if '_smt_assertions' not in problem:
+        return None
+    import z3
+    substitutions = []
+    for original, normalized in problem['_name_map'].items():
+        value = values[normalized]
+        substitutions.append((z3.Int(original), z3.IntVal(value)))
+        substitutions.append((z3.Bool(original), z3.BoolVal(bool(value))))
+    for index, assertion in enumerate(problem['_smt_assertions']):
+        if not z3.is_true(z3.simplify(z3.substitute(assertion, *substitutions))):
+            raise ValueError(f'original SMT assertion {index} not satisfied')
+    return True
 
-    assignment = result.get('assignment', [])
-    name2idx = result.get('name2idx', {})
 
-    if vpool is None:
-        vpool = result.get('vpool')
+def verify_values(problem, values):
+    """Shared witness check for SAT decoding and the Z3 baseline."""
+    if set(values) != set(problem.get('variables', {})):
+        raise ValueError('witness does not cover exactly the original variables')
+    for name, value in values.items():
+        info = problem['variables'][name]
+        if not isinstance(value, int) or not number(info['lb']) <= value <= number(info['ub']):
+            raise ValueError(f'{name}={value} outside original integer domain')
+    checks = []
+    for index, constraint in enumerate(problem.get('constraints', [])):
+        valid, desc = check_constraint(constraint, values)
+        checks.append({'index': index, 'satisfied': valid, 'description': desc})
+        if not valid:
+            raise ValueError(f'constraint {index} violated: {desc}')
+    source_valid = check_original_smt(problem, values)
+    objective = evaluate_polynomial(problem.get('objective', {}).get('terms', []), values)
+    return objective, checks, source_valid
 
-    if not assignment:
-        report['valid'] = False
-        report['errors'].append("No assignment data")
-        return False, report
 
-    # 1. Decode variable values
+def verify_solution(problem, result, encoding, vpool=None):
+    report = {'valid': False, 'errors': [], 'warnings': [], 'var_values': {},
+              'constraint_checks': [], 'computed_objective': None,
+              'reported_objective': result.get('objective_value')}
     try:
-        var_values = decode_assignment(assignment, encoding, name2idx, problem, vpool)
-        report['var_values'] = var_values
-    except Exception as e:
-        report['warnings'].append(f"Variable decoding failed: {e}")
-        return True, report
-
-    # 2. Check constraints
-    constraints = problem.get('constraints', [])
-    all_satisfied = True
-
-    for i, constr in enumerate(constraints):
-        satisfied, desc = check_constraint(constr, var_values)
-        report['constraint_checks'].append({
-            'index': i,
-            'satisfied': satisfied,
-            'description': desc
-        })
-        if not satisfied:
-            all_satisfied = False
-            report['errors'].append(f"Constraint {i} violated: {desc}")
-
-    # 3. Compute objective
-    objective = problem.get('objective', {})
-    terms = objective.get('terms', [])
-    if terms:
-        computed_obj = evaluate_polynomial(terms, var_values)
-        report['computed_objective'] = computed_obj
-
-        reported_obj = result.get('objective_value')
-        if reported_obj is not None and computed_obj != reported_obj:
-            report['warnings'].append(
-                f"Objective mismatch: computed={computed_obj}, reported={reported_obj}"
-            )
-
-    report['valid'] = all_satisfied and len(report['errors']) == 0
-
+        processed = result.get('processed_problem', problem)
+        values = decode_assignment(result.get('assignment'), encoding,
+                                   result.get('name2idx', {}), processed,
+                                   vpool if vpool is not None else result.get('vpool'))
+        meta = result.get('preprocess_meta', {})
+        values.update(meta.get('objective', {}).get('probed_variables', {}))
+        for name, shift in meta.get('variable_shifts', {}).items():
+            values[name] += shift
+        report['var_values'] = values
+        computed, checks, source_valid = verify_values(problem, values)
+        report['constraint_checks'] = checks
+        report['source_smt_verified'] = source_valid
+        report['computed_objective_exact'] = str(computed)
+        report['computed_objective'] = int(computed) if computed.denominator == 1 else float(computed)
+        exact = result.get('objective_value_exact')
+        reported = result.get('objective_value')
+        if exact is not None and number(exact) != computed:
+            raise ValueError(f'objective mismatch: computed={computed}, reported={exact}')
+        if reported is not None:
+            if exact is None:
+                matches = number(reported) == computed
+            else:
+                matches = reported == report['computed_objective']
+            if not matches:
+                raise ValueError(f'objective mismatch: computed={computed}, reported={reported}')
+        report['valid'] = True
+    except TimeoutError:
+        raise
+    except Exception as exc:
+        report['errors'].append(str(exc))
     return report['valid'], report
 
 
-def format_verification_report(report: Dict[str, Any]) -> str:
-    lines = []
-
-    if report['valid']:
-        lines.append("Verification PASSED")
-    else:
-        lines.append("Verification FAILED")
-
+def format_verification_report(report):
+    lines = ['Verification PASSED' if report['valid'] else 'Verification FAILED']
     if report['var_values']:
-        var_str = ", ".join(f"{k}={v}" for k, v in sorted(report['var_values'].items()))
-        lines.append(f"  Variables: {var_str}")
-
-    checks = report.get('constraint_checks', [])
-    if checks:
-        passed = sum(1 for c in checks if c['satisfied'])
-        lines.append(f"  Constraints: {passed}/{len(checks)} passed")
-
+        lines.append('  Variables: ' + ', '.join(f'{k}={v}' for k, v in sorted(report['var_values'].items())))
+    if report.get('source_smt_verified'):
+        lines.append('  Original SMT assertions: passed')
     if report['computed_objective'] is not None:
-        lines.append(f"  Computed objective: {report['computed_objective']}")
-    if report['reported_objective'] is not None:
-        lines.append(f"  Solver objective: {report['reported_objective']}")
-
-    for err in report.get('errors', []):
-        lines.append(f"  ERROR: {err}")
-    for warn in report.get('warnings', []):
-        lines.append(f"  WARNING: {warn}")
-
-    return "\n".join(lines)
-
-
+        lines.append(f"  Computed objective: {report.get('computed_objective_exact', report['computed_objective'])}")
+    lines.extend(f'  ERROR: {error}' for error in report['errors'])
+    return '\n'.join(lines)

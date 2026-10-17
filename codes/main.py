@@ -1,5 +1,6 @@
 import argparse
 import json
+from fractions import Fraction
 import signal
 import time
 import sys
@@ -10,10 +11,14 @@ if hasattr(sys, 'set_int_max_str_digits'):
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from solver.solve import build_and_solve, build_wcnf, EncodingTimeoutError
+from solver.solve import build_and_solve, build_wcnf, EncodingTimeoutError, _write_wcnf
 from encoders.onehot import _EncodingTimeout
 from solver.config import EncodingConfig
 from tools.verify import verify_solution, format_verification_report
+
+class _RunTimeout(TimeoutError):
+    pass
+
 
 _timeout_ctx = {"problem_name": "", "encoding": "", "solver": "", "t_start": 0}
 
@@ -24,7 +29,7 @@ def load_json_problem(input_path):
         if not prefix.strip():
             raise ValueError("input file is empty")
         f.seek(0)
-        return json.load(f)
+        return json.load(f, parse_float=Fraction)
 
 def load_problem(input_path, k=None):
     if input_path.endswith('.json'):
@@ -68,6 +73,7 @@ def format_result(result, problem_name, time_read, time_total):
         f"Solver {result['solver']} "
         f"Status {status} "
         f"OPT {opt_display} "
+        f"OPTExact {result.get('objective_value_exact')} "
         f"Cost {result['maxsat_cost']} "
         f"Vars {result['num_variables']} "
         f"Hard {result['num_hard_clauses']} "
@@ -229,13 +235,13 @@ Solvers:
     parser.add_argument(
         "--no-preprocess",
         action="store_true",
-        help="disable preprocessing"
+        help="disable optional bound propagation and variable fixing"
     )
 
     parser.add_argument(
         "--verify",
         action="store_true",
-        help="verify the correctness of solving result"
+        help="display the original-problem verification report"
     )
 
     parser.add_argument(
@@ -267,14 +273,8 @@ Solvers:
         })
 
         def _on_timeout(signum, frame):
-            elapsed = time.time() - _timeout_ctx["t_start"]
-            print(f"\n>>> Benchmark {_timeout_ctx['problem_name']} "
-                  f"Encoding {_timeout_ctx['encoding']} "
-                  f"Solver {_timeout_ctx['solver']} "
-                  f"Status TIMEOUT OPT N/A "
-                  f"TimeTotal {elapsed:.3f}")
-            sys.stdout.flush()
-            os._exit(0)
+            # Unwind subprocess.run so its child is killed and reaped.
+            raise _RunTimeout('Total runtime deadline exceeded')
 
         signal.signal(signal.SIGALRM, _on_timeout)
         signal.alarm(args.timeout)
@@ -291,6 +291,8 @@ Solvers:
 
     try:
         problem = load_problem(args.input, k=args.k)
+    except _RunTimeout:
+        raise
     except Exception as e:
         print(f"Error: failed to parse problem file - {e}", file=sys.stderr)
         time_total = time.time() - t_start
@@ -313,7 +315,7 @@ Solvers:
     cfg.decomp_exact = not args.decomp_relaxed
     cfg.decomp_shared = not args.no_decomp_shared
     cfg.weight_gcd_normalize = not args.no_weight_gcd
-    if args.timeout:
+    if args.timeout and hasattr(signal, 'SIGALRM'):
         total_timeout = int(args.timeout)
         now = time.time()
         elapsed = now - t_start
@@ -335,12 +337,22 @@ Solvers:
               f"current is {args.encoding}, ignoring", file=sys.stderr)
         cfg.use_decomposition = False
 
-    if args.output and args.solver == "NONE":
-        if args.verbose:
-            print(f"\nBuilding WCNF ({args.encoding} encoding)...")
-        wcnf, name2idx, _vpool = build_wcnf(problem, args.encoding, cfg)
-        wcnf.to_file(args.output)
-        print(f"WCNF saved to: {args.output}")
+    if args.solver == 'NONE':
+        if not args.output:
+            parser.error('--solver NONE requires --output')
+        try:
+            wcnf, _, _ = build_wcnf(problem, args.encoding, cfg)
+            _write_wcnf(wcnf, args.output)
+        except _RunTimeout:
+            raise
+        except (EncodingTimeoutError, _EncodingTimeout) as exc:
+            print(f'>>> Benchmark {problem_name} Encoding {args.encoding} Solver NONE Status TIMEOUT OPT N/A TimeTotal {time.time()-t_start:.3f}')
+            return 0
+        except Exception as exc:
+            print(f'Error: encoding failed - {exc}', file=sys.stderr)
+            print(f'>>> Benchmark {problem_name} Encoding {args.encoding} Solver NONE Status ERROR OPT N/A TimeTotal {time.time()-t_start:.3f}')
+            return 1
+        print(f'WCNF saved to: {args.output}')
         return 0
 
     if args.verbose:
@@ -361,7 +373,8 @@ Solvers:
         if args.timeout:
             remaining = max(0.0, float(args.timeout) - (time.time() - t_start))
             cfg.external_solver_timeout = max(0, int(remaining - 5.0))
-        result = build_and_solve(problem, args.encoding, cfg, solver=args.solver)
+            cfg.rc2_timeout = max(0.001, remaining)
+        result = build_and_solve(problem, args.encoding, cfg, solver=args.solver, output_path=args.output)
     except (EncodingTimeoutError, _EncodingTimeout) as e:
         time_total = time.time() - t_start
         print(f"  [encoding-timeout] {e}", file=sys.stderr)
@@ -372,6 +385,8 @@ Solvers:
               f"Encoding {enc_str} Solver {args.solver} "
               f"Status TIMEOUT OPT N/A TimeTotal {time_total:.3f}")
         return 1
+    except _RunTimeout:
+        raise
     except Exception as e:
         print(f"Error: solving failed - {e}", file=sys.stderr)
         if args.verbose:
@@ -384,25 +399,26 @@ Solvers:
         return 1
     time_total = time.time() - t_start
 
-    if args.output:
-        wcnf, _ = build_wcnf(problem, args.encoding, cfg)
-        wcnf.to_file(args.output)
-        if args.verbose:
-            print(f"\nWCNF saved to: {args.output}")
-
     if args.verbose:
         print_verbose(result, problem)
 
-    if args.verify:
-        if args.verbose:
-            print(f"\nVerifying solving result...")
-        is_valid, report = verify_solution(problem, result, args.encoding)
-        print("\n" + format_verification_report(report))
+    if args.verify and 'verification' in result:
+        print("\n" + format_verification_report(result['verification']))
 
     print("\n" + format_result(result, problem_name, time_read, time_total))
 
-    return 0
+    return 1 if result['solver_status'] == 'INVALID' else 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        exit_code = main()
+    except _RunTimeout:
+        ctx = _timeout_ctx
+        elapsed = time.time() - ctx['t_start']
+        print(f">>> Benchmark {ctx['problem_name']} Encoding {ctx['encoding']} Solver {ctx['solver']} Status TIMEOUT OPT N/A TimeTotal {elapsed:.3f}")
+        exit_code = 0
+    finally:
+        if hasattr(signal, 'SIGALRM'):
+            signal.alarm(0)
+    sys.exit(exit_code)

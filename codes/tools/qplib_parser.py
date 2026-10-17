@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import os
+from fractions import Fraction
+from math import ceil, floor
 from typing import Dict, Any, List
 
 
@@ -16,7 +18,7 @@ def parse_qplib_file(filepath: str) -> Dict[str, Any]:
 
     def next_line() -> str:
         while pos[0] < len(raw_lines):
-            line = raw_lines[pos[0]].strip()
+            line = _strip_comment(raw_lines[pos[0]])
             pos[0] += 1
             if line:
                 return line
@@ -26,10 +28,13 @@ def parse_qplib_file(filepath: str) -> Dict[str, Any]:
         return _strip_comment(next_line())
 
     def next_int() -> int:
-        return int(float(next_val()))
+        value = Fraction(next_val())
+        if value.denominator != 1:
+            raise ValueError('expected integer in QPLIB header/count')
+        return int(value)
 
-    def next_float() -> float:
-        return float(next_val())
+    def next_float() -> Fraction:
+        return Fraction(next_val())
 
     # ── 1. Header ──────────────────────────────────────────────
     problem_name = next_val()
@@ -41,11 +46,19 @@ def parse_qplib_file(filepath: str) -> Dict[str, Any]:
     var_type = problem_type[1]   # B / I / C / M / G
     con_type = problem_type[2]   # B / L / Q / N
 
-    has_constraints = (con_type != 'B')
+    if var_type not in ('B', 'I'):
+        raise ValueError(f'QPLIB variable type {var_type} is not supported: bounded pure integer problems required')
+    if obj_type not in ('L', 'Q', 'D', 'C') or con_type not in ('N', 'B', 'L', 'Q', 'D', 'C'):
+        raise ValueError(f'unsupported QPLIB problem type: {problem_type}')
+    if obj_sense_raw not in ('maximize', 'minimize'):
+        raise ValueError(f'unsupported QPLIB objective sense: {obj_sense_raw}')
+    has_constraints = (con_type not in ('N', 'B'))
     has_obj_quad = (obj_type in ('Q', 'D', 'C'))
-    has_con_quad = (con_type in ('Q', 'N'))
+    has_con_quad = (con_type in ('Q', 'D', 'C'))
     is_binary = (var_type == 'B')
 
+    if con_type == 'N' and not is_binary:
+        raise ValueError('unbounded QPLIB integer variables are unsupported')
     num_constraints = next_int() if has_constraints else 0
 
     problem = {
@@ -66,19 +79,20 @@ def parse_qplib_file(filepath: str) -> Dict[str, Any]:
         for _ in range(num_quad):
             parts = next_line().split()
             i, j = int(parts[0]), int(parts[1])
-            val = float(parts[2])
+            val = Fraction(parts[2])
             if val == 0:
                 continue
             if i == j:
                 # Hessian convention: coeff of x_i^2 = Q[i][i] / 2
                 problem['objective']['terms'].append({
-                    'c': val / 2.0,
+                    'c': val / 2,
                     'vars': {f'x{i}': 2}
                 })
             else:
-                # Off-diagonal: coeff of x_i*x_j = Q[i][j]
+                # QPLIB stores one triangle of Q in (1/2) x^T Q x.
+                # Off-diagonal entries also carry the factor 1/2.
                 problem['objective']['terms'].append({
-                    'c': val,
+                    'c': val / 2,
                     'vars': {f'x{i}': 1, f'x{j}': 1}
                 })
 
@@ -88,7 +102,7 @@ def parse_qplib_file(filepath: str) -> Dict[str, Any]:
     linear_overrides = {}
     for _ in range(num_nd_linear):
         parts = next_line().split()
-        linear_overrides[int(parts[0])] = float(parts[1])
+        linear_overrides[int(parts[0])] = Fraction(parts[1])
 
     for vi in range(1, num_vars + 1):
         c = linear_overrides.get(vi, default_linear)
@@ -113,14 +127,14 @@ def parse_qplib_file(filepath: str) -> Dict[str, Any]:
         for _ in range(num_cq):
             parts = next_line().split()
             ci, i, j = int(parts[0]), int(parts[1]), int(parts[2])
-            val = float(parts[3])
+            val = Fraction(parts[3])
             if val == 0:
                 continue
             con_quad.setdefault(ci, [])
             if i == j:
-                con_quad[ci].append({'c': val / 2.0, 'vars': {f'x{i}': 2}})
+                con_quad[ci].append({'c': val / 2, 'vars': {f'x{i}': 2}})
             else:
-                con_quad[ci].append({'c': val, 'vars': {f'x{i}': 1, f'x{j}': 1}})
+                con_quad[ci].append({'c': val / 2, 'vars': {f'x{i}': 1, f'x{j}': 1}})
 
     # ── 6. Constraint linear terms (Jacobian) ─────────────────
     con_linear = {}
@@ -129,7 +143,7 @@ def parse_qplib_file(filepath: str) -> Dict[str, Any]:
         for _ in range(num_jac):
             parts = next_line().split()
             ci, vi = int(parts[0]), int(parts[1])
-            val = float(parts[2])
+            val = Fraction(parts[2])
             if val == 0:
                 continue
             con_linear.setdefault(ci, [])
@@ -144,14 +158,14 @@ def parse_qplib_file(filepath: str) -> Dict[str, Any]:
         lhs_map = {}
         for _ in range(num_nd_lhs):
             parts = next_line().split()
-            lhs_map[int(parts[0])] = float(parts[1])
+            lhs_map[int(parts[0])] = Fraction(parts[1])
 
         default_rhs = next_float()
         num_nd_rhs = next_int()
         rhs_map = {}
         for _ in range(num_nd_rhs):
             parts = next_line().split()
-            rhs_map[int(parts[0])] = float(parts[1])
+            rhs_map[int(parts[0])] = Fraction(parts[1])
 
         # Build constraint list
         for ci in range(1, num_constraints + 1):
@@ -159,8 +173,8 @@ def parse_qplib_file(filepath: str) -> Dict[str, Any]:
             lhs = lhs_map.get(ci, default_lhs)
             rhs = rhs_map.get(ci, default_rhs)
 
-            inf_lhs = (lhs <= -1e300)
-            inf_rhs = (rhs >= 1e300)
+            inf_lhs = (lhs <= -infinity_val)
+            inf_rhs = (rhs >= infinity_val)
 
             if inf_lhs and inf_rhs:
                 continue
@@ -172,7 +186,7 @@ def parse_qplib_file(filepath: str) -> Dict[str, Any]:
                 problem['constraints'].append({
                     'terms': terms, 'rel': '>=', 'rhs': lhs
                 })
-            elif abs(lhs - rhs) < 1e-10:
+            elif lhs == rhs:
                 problem['constraints'].append({
                     'terms': terms, 'rel': '==', 'rhs': rhs
                 })
@@ -195,24 +209,22 @@ def parse_qplib_file(filepath: str) -> Dict[str, Any]:
         lb_map = {}
         for _ in range(num_nd_lb):
             parts = next_line().split()
-            lb_map[int(parts[0])] = float(parts[1])
+            lb_map[int(parts[0])] = Fraction(parts[1])
 
         default_ub = next_float()
         num_nd_ub = next_int()
         ub_map = {}
         for _ in range(num_nd_ub):
             parts = next_line().split()
-            ub_map[int(parts[0])] = float(parts[1])
+            ub_map[int(parts[0])] = Fraction(parts[1])
 
         for vi in range(1, num_vars + 1):
             lb = lb_map.get(vi, default_lb)
             ub = ub_map.get(vi, default_ub)
-            if lb <= -1e300:
-                lb = 0
-            if ub >= 1e300:
-                ub = 1000
+            if lb <= -infinity_val or ub >= infinity_val:
+                raise ValueError(f'x{vi} has no finite QPLIB bounds; refusing artificial bounds')
             problem['variables'][f'x{vi}'] = {
-                'lb': int(lb), 'ub': int(ub)
+                'lb': ceil(lb), 'ub': floor(ub)
             }
 
     print(f"Parsed {problem_name} ({problem_type}): "

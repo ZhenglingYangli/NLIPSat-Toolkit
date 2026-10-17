@@ -6,8 +6,12 @@ from typing import Dict, Any, List, Tuple, Optional
 from pysat.formula import WCNF, IDPool
 
 
-class _EncodingTimeout(RuntimeError):
-    pass
+from tools.preprocessing import EncodingTimeoutError as _EncodingTimeout
+
+
+def _check_deadline(deadline):
+    if deadline > 0 and time.time() > deadline:
+        raise _EncodingTimeout('Encoding deadline exceeded')
 
 
 def encode_term_oh(
@@ -21,6 +25,7 @@ def encode_term_oh(
     deadline: float = 0.0
 ) -> Tuple[Dict[Tuple, Tuple[int, int]], List[List[int]], List[Tuple[List[int], int]]]:
 
+    _check_deadline(deadline)
     term_vars = term.get('vars', {}) or {}
     c = int(term.get('c', 1))
 
@@ -147,7 +152,8 @@ def encode_objective_oh(
     problem: Dict[str, Any],
     name2idx: Dict[str, int],
     vpool: IDPool,
-    lb_map: Dict[str, int] = None
+    lb_map: Dict[str, int] = None,
+    deadline: float = 0.0
 ) -> WCNF:
     w = WCNF()
     terms = problem['objective'].get('terms', [])
@@ -156,7 +162,7 @@ def encode_objective_oh(
         return w
 
     z_mapping, hard_clauses, direct_soft = encode_polynomial_oh(
-        terms, problem, name2idx, vpool, "z_oh_obj", lb_map, for_objective=True
+        terms, problem, name2idx, vpool, "z_oh_obj", lb_map, for_objective=True, deadline=deadline
     )
 
     for clause in hard_clauses:

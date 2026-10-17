@@ -50,8 +50,6 @@ def _parse_cnf_raw(filepath: str):
 
     if n_vars is None:
         n_vars = max((abs(lit) for c in clauses for lit in c), default=0)
-    if n_vars <= 0:
-        n_vars = 1
 
     return n_vars, clauses
 
@@ -78,9 +76,7 @@ def parse_diversesat(filepath: str, k: int) -> Dict[str, Any]:
         if not clause:
             for m in range(1, k + 1):
                 constraints.append({
-                    'terms': [{'c': 1, 'vars': {vname(1, m): 1}}],
-                    'rel': '>=',
-                    'rhs': 2,
+                    'terms': [], 'rel': '>=', 'rhs': 1,
                 })
             continue
 

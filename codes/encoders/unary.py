@@ -4,7 +4,7 @@ import time
 from typing import Dict, Any, List, Tuple, Optional
 from pysat.formula import WCNF, IDPool
 
-from .onehot import _EncodingTimeout
+from .onehot import _EncodingTimeout, _check_deadline
 
 
 def _compute_difference_def8(
@@ -19,32 +19,13 @@ def _compute_difference_def8(
     if any(r == 0 for r in r_tuple):
         return 0
 
-    diff = 0
-    for mask in range(1 << m):
-        r_prime = list(r_tuple)
-        popcnt = 0
-        for j in range(m):
-            if (mask >> j) & 1:
-                r_prime[j] -= 1
-                popcnt += 1
-
-        # Evaluate term at r_prime assignment
-        c = int(term.get('c', 1))
-        term_vars = term.get('vars', {}) or {}
-        t_val = c
-        for vi, vn in enumerate(sorted_var_names):
-            k_q = int(term_vars.get(vn, 0))
-            if k_q == 0:
-                continue
-            lb = int(lb_map.get(vn, 0)) if lb_map else 0
-            t_val *= ((r_prime[vi] + lb) ** k_q)
-
-        if popcnt % 2 == 1:
-            diff -= t_val
-        else:
-            diff += t_val
-
-    return diff
+    # A monomial is separable: mixed finite differences factor by variable.
+    difference = int(term.get('c', 1))
+    for name, r in zip(sorted_var_names, r_tuple):
+        power = int(term.get('vars', {}).get(name, 0))
+        shift = int(lb_map.get(name, 0)) if lb_map else 0
+        difference *= (r + shift)**power - (r - 1 + shift)**power
+    return difference
 
 
 def encode_term_una(
@@ -57,6 +38,7 @@ def encode_term_una(
     for_objective: bool = False,
     deadline: float = 0.0
 ) -> Tuple[Dict[Tuple, Tuple[int, int]], List[List[int]], List[Tuple[List[int], int]]]:
+    _check_deadline(deadline)
     term_vars = term.get('vars', {}) or {}
     c = int(term.get('c', 1))
 
@@ -177,7 +159,8 @@ def encode_objective_una(
     problem: Dict[str, Any],
     name2idx: Dict[str, int],
     vpool: IDPool,
-    lb_map: Dict[str, int] = None
+    lb_map: Dict[str, int] = None,
+    deadline: float = 0.0
 ) -> WCNF:
     w = WCNF()
     terms = problem['objective'].get('terms', [])
@@ -186,7 +169,7 @@ def encode_objective_una(
         return w
 
     z_mapping, hard_clauses, direct_soft = encode_polynomial_una(
-        terms, problem, name2idx, vpool, "z_una_obj", lb_map, for_objective=True
+        terms, problem, name2idx, vpool, "z_una_obj", lb_map, for_objective=True, deadline=deadline
     )
 
     for clause in hard_clauses:
