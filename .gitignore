@@ -1,0 +1,13 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Local environments
+.venv/
+venv/
+
+# Build and test artifacts
+build/
+dist/
+*.egg-info/
+.pytest_cache/
