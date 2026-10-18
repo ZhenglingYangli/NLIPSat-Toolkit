@@ -1,0 +1,81 @@
+--- a/cpmpy/solvers/nlipsat.py
++++ b/cpmpy/solvers/nlipsat.py
+@@ -510,7 +510,6 @@
+         self.nlip_problem = problem
+ 
+         from nlipsat import EncodingConfig, build_wcnf
+-        _install_nlipsat_workarounds()
+         cfg = EncodingConfig(
+             encoding=encoding,
+             use_decomposition=use_decomposition,
+@@ -558,54 +557,15 @@
+         return True
+ 
+     def _solve_rc2(self, wcnf, remaining):
+-        from pysat.examples.rc2 import RC2
+-
+-        solver = RC2(wcnf, adapt=True, exhaust=True, trim=3)
+-        # Core exhaustion calls the SAT oracle with expect_interrupt=False, so a
+-        # time limit never aborts that call. Forward the flag from compute() and
+-        # stop once interrupt() has been requested. The oracle is deleted afterwards.
+-        oracle_call = solver._call_oracle
+-
+-        def _call_oracle(assumptions=[], expect_interrupt=False):
+-            if solver.interrupted:
+-                return False
+-            return oracle_call(
+-                assumptions,
+-                expect_interrupt=bool(solver.expect_interrupt or expect_interrupt),
+-            )
+-
+-        solver._call_oracle = _call_oracle
+-        timer = None
+-        interrupted = False
++        from solver.solve import solve_rc2
+         t0 = time.time()
+-        try:
+-            if remaining is None:
+-                solution = solver.compute()
+-            else:
+-                timer = Timer(remaining, solver.interrupt)
+-                timer.start()
+-                solution = solver.compute(expect_interrupt=True)
+-                interrupted = bool(getattr(solver, "interrupted", False))
+-            if solution is None:
+-                return (
+-                    ExitStatus.UNKNOWN if interrupted else ExitStatus.UNSATISFIABLE,
+-                    None,
+-                    None,
+-                    time.time() - t0,
+-                )
+-            cost = solver.cost
+-            assignment = list(solution)
+-        finally:
+-            if timer is not None:
+-                timer.cancel()
+-            solver.delete()
+-
+-        if interrupted:
+-            status = ExitStatus.FEASIBLE
+-        elif self.has_objective():
+-            status = ExitStatus.OPTIMAL
++        cost, assignment = solve_rc2(wcnf, timeout=0 if remaining is None else remaining)
++        if assignment is None:
++            status = ExitStatus.UNKNOWN
++        elif cost < 0:
++            status = ExitStatus.UNSATISFIABLE
+         else:
+-            status = ExitStatus.FEASIBLE
++            status = ExitStatus.OPTIMAL if self.has_objective() else ExitStatus.FEASIBLE
+         return status, cost, assignment, time.time() - t0
+ 
+     def _solve_external(self, wcnf, cfg, remaining):
+@@ -620,7 +580,7 @@
+         path = paths[self.subsolver]
+         if not (os.path.isfile(path) and os.access(path, os.X_OK)):
+             raise ModuleNotFoundError(f"CPM_nlipsat: subsolver '{self.subsolver}' was not found at {path}")
+-        timeout = 0 if remaining is None else max(1, math.ceil(remaining))
++        timeout = 0 if remaining is None else remaining
+         t0 = time.time()
+         try:
+             cost, assignment, status = solve_external(wcnf, cfg.workdir, path, timeout=timeout)

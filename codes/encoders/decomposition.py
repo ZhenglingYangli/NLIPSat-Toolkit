@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 
-import math
 from typing import Dict, Any, List, Tuple, Optional
 from pysat.formula import IDPool
-from pysat.pb import PBEnc
+from .onehot import _check_deadline
 
 
 def mul(
@@ -13,8 +12,13 @@ def mul(
     prefix: str,
     ub_a: int,
     ub_b: int,
-    sense: int = 0
+    sense: int = 0,
+    deadline: float = 0.0
 ) -> Tuple[List[int], List[List[int]]]:
+    _check_deadline(deadline)
+    if sense not in (-1, 0, 1):
+        raise ValueError(f'unsupported multiplication sense: {sense}')
+    vpool._multiplication_count = getattr(vpool, '_multiplication_count', 0) + 1
     num_bits_a = len(a_bits)
     num_bits_b = len(b_bits)
 
@@ -24,6 +28,7 @@ def mul(
     z_weights = []
 
     for r_a in range(num_bits_a):
+        _check_deadline(deadline)
         for r_b in range(num_bits_b):
             z = vpool.id(f'{prefix}_z_{r_a}_{r_b}')
 
@@ -42,31 +47,32 @@ def mul(
             z_weights.append(2 ** (r_a + r_b))
 
     ub_product = ub_a * ub_b
-    num_bits_y = math.ceil(math.log2(ub_product + 1)) if ub_product > 0 else 1
+    num_bits_y = max(1, ub_product.bit_length())
 
     y_bits = [vpool.id(f'{prefix}_y_{r}') for r in range(num_bits_y)]
 
     y_lits = y_bits[:]
     y_weights = [2 ** r for r in range(num_bits_y)]
 
-    # Mul-2: PB constraint relating Y and Z
+    # Reuse the exact PB encoder, including its large-integer adder path.
+    from .constraints import _encode_pb_constraint
     if sense == 1:
         leq_lits = y_lits + [-z for z in z_lits]
         leq_weights = y_weights + z_weights
         leq_bound = sum(z_weights)
-        cnf = PBEnc.leq(lits=leq_lits, weights=leq_weights, bound=leq_bound, vpool=vpool)
+        clauses = _encode_pb_constraint(leq_lits, leq_weights, leq_bound, '<=', vpool, [], deadline=deadline)
     elif sense == -1:
         geq_lits = y_lits + [-z for z in z_lits]
         geq_weights = y_weights + z_weights
         geq_bound = sum(z_weights)
-        cnf = PBEnc.geq(lits=geq_lits, weights=geq_weights, bound=geq_bound, vpool=vpool)
+        clauses = _encode_pb_constraint(geq_lits, geq_weights, geq_bound, '>=', vpool, [], deadline=deadline)
     else:
         all_lits = z_lits + [-y for y in y_lits]
         all_weights = z_weights + y_weights
         bound = sum(y_weights)
-        cnf = PBEnc.equals(lits=all_lits, weights=all_weights, bound=bound, vpool=vpool)
+        clauses = _encode_pb_constraint(all_lits, all_weights, bound, '==', vpool, [], deadline=deadline)
 
-    hard_clauses.extend(cnf.clauses)
+    hard_clauses.extend(clauses)
 
     return y_bits, hard_clauses
 
@@ -74,9 +80,13 @@ class MulCache:
 
     def __init__(self):
         self._cache: Dict[tuple, Tuple[List[int], int]] = {}
+        self.hits = 0
 
     def get(self, key: tuple) -> Optional[Tuple[List[int], int]]:
-        return self._cache.get(key)
+        value = self._cache.get(key)
+        if value is not None:
+            self.hits += 1
+        return value
 
     def put(self, key: tuple, y_bits: List[int], ub_product: int):
         self._cache[key] = (y_bits, ub_product)
@@ -99,15 +109,17 @@ def mul_cached(
     ub_a: int,
     ub_b: int,
     sense: int = 0,
-    cache: Optional[MulCache] = None
+    cache: Optional[MulCache] = None,
+    deadline: float = 0.0
 ) -> Tuple[List[int], List[List[int]], int]:
     if cache is not None:
         key = MulCache.make_key(a_bits, b_bits, sense)
         cached = cache.get(key)
         if cached is not None:
+            vpool._multiplication_cache_hits = getattr(vpool, '_multiplication_cache_hits', 0) + 1
             return cached[0], [], cached[1]  # Reuse bits, no new clauses
 
-    y_bits, hard_clauses = mul(a_bits, b_bits, vpool, prefix, ub_a, ub_b, sense)
+    y_bits, hard_clauses = mul(a_bits, b_bits, vpool, prefix, ub_a, ub_b, sense, deadline=deadline)
     ub_product = ub_a * ub_b
 
     if cache is not None:
@@ -121,7 +133,8 @@ def decompose_sequential(
     vpool: IDPool,
     prefix: str,
     sense: int = 0,
-    cache: Optional[MulCache] = None
+    cache: Optional[MulCache] = None,
+    deadline: float = 0.0
 ) -> Tuple[List[int], List[List[int]], int]:
     if len(omega) == 0:
         return [], [], 1
@@ -136,7 +149,7 @@ def decompose_sequential(
     _, _, ub2, bits2 = omega[1]
 
     acc_bits, clauses, acc_ub = mul_cached(
-        bits1, bits2, vpool, f'{prefix}_mul_1_2', ub1, ub2, sense, cache
+        bits1, bits2, vpool, f'{prefix}_mul_1_2', ub1, ub2, sense, cache, deadline=deadline
     )
     hard_clauses.extend(clauses)
 
@@ -145,7 +158,7 @@ def decompose_sequential(
         acc_bits, clauses, acc_ub = mul_cached(
             acc_bits, bits_k, vpool,
             f'{prefix}_mul_1to{k}_and_{k+1}',
-            acc_ub, ub_k, sense, cache
+            acc_ub, ub_k, sense, cache, deadline=deadline
         )
         hard_clauses.extend(clauses)
 
@@ -156,7 +169,8 @@ def decompose_binary_tree(
     vpool: IDPool,
     prefix: str,
     sense: int = 0,
-    cache: Optional[MulCache] = None
+    cache: Optional[MulCache] = None,
+    deadline: float = 0.0
 ) -> Tuple[List[int], List[List[int]], int]:
     if len(omega) == 0:
         return [], [], 1
@@ -170,15 +184,15 @@ def decompose_binary_tree(
     right = omega[mid:]
 
     left_bits, left_clauses, left_ub = decompose_binary_tree(
-        left, vpool, f'{prefix}_L', sense, cache
+        left, vpool, f'{prefix}_L', sense, cache, deadline=deadline
     )
     right_bits, right_clauses, right_ub = decompose_binary_tree(
-        right, vpool, f'{prefix}_R', sense, cache
+        right, vpool, f'{prefix}_R', sense, cache, deadline=deadline
     )
 
     result_bits, mul_clauses, result_ub = mul_cached(
         left_bits, right_bits, vpool, f'{prefix}_mul',
-        left_ub, right_ub, sense, cache
+        left_ub, right_ub, sense, cache, deadline=deadline
     )
 
     all_clauses = left_clauses + right_clauses + mul_clauses
@@ -193,9 +207,13 @@ def encode_term_decomp(
     lb_map: Dict[str, int] = None,
     sense: int = 0,
     strategy: str = "sequential",
-    cache: Optional[MulCache] = None
+    cache: Optional[MulCache] = None,
+    deadline: float = 0.0
 ) -> Tuple[Dict[int, Tuple[int, int]], List[List[int]]]:
 
+    _check_deadline(deadline)
+    if strategy not in ('sequential', 'binary_tree'):
+        raise ValueError(f'unsupported decomposition strategy: {strategy}')
     term_vars = term.get('vars', {}) or {}
     c = int(term.get('c', 1))
 
@@ -206,7 +224,7 @@ def encode_term_decomp(
     for var_name, power in sorted(term_vars.items()):
         q = name2idx[var_name]
         ub = int(problem['variables'][var_name]['ub'])
-        num_bits = math.ceil(math.log2(ub + 1)) if ub > 0 else 1
+        num_bits = max(1, ub.bit_length())
         bits = [vpool.id(f'x_{q}@{r}') for r in range(num_bits)]
 
         for _ in range(int(power)):
@@ -217,11 +235,11 @@ def encode_term_decomp(
 
     if strategy == "binary_tree":
         result_bits, hard_clauses, _ = decompose_binary_tree(
-            omega, vpool, prefix, sense, cache
+            omega, vpool, prefix, sense, cache, deadline=deadline
         )
     else:
         result_bits, hard_clauses, _ = decompose_sequential(
-            omega, vpool, prefix, sense, cache
+            omega, vpool, prefix, sense, cache, deadline=deadline
         )
 
     z_mapping = {}

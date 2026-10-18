@@ -24,7 +24,7 @@ CODES_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "codes")
 sys.path.insert(0, CODES_DIR)
 
 try:
-    from z3 import Int, IntVal, Optimize, Solver, SolverFor, sat, unsat, unknown, RatVal
+    from z3 import Int, IntVal, Optimize, Solver, SolverFor, sat, unsat, unknown, RatVal, And, Or, is_true, simplify
     HAS_Z3 = True
 except ImportError:
     HAS_Z3 = False
@@ -48,7 +48,7 @@ def load_instance(filepath, k=None):
         return parse_cnf_file(filepath)
     else:
         with open(filepath) as f:
-            return json.load(f)
+            return json.load(f, parse_float=Fraction)
 
 
 # ---------------------------------------------------------------------------
@@ -57,54 +57,26 @@ def load_instance(filepath, k=None):
 
 def to_z3_coeff(c):
     """Convert a Python number to Z3-compatible int or RatVal."""
-    f = Fraction(c).limit_denominator(10**15)
+    f = Fraction(str(c))
     return f.numerator if f.denominator == 1 else RatVal(f.numerator, f.denominator)
 
 
 def build_expr(terms, z3_vars):
-    """Build a Z3 arithmetic expression from a list of polynomial terms.
-
-    Each term is {'c': coeff, 'vars': {'x1': power1, 'x2': power2, ...}}.
-    """
-    expr = 0
+    expr = IntVal(0)
     for term in terms:
-        c = to_z3_coeff(term.get('c', 1))
-        tvars = term.get('vars', {})
-        if not tvars:
-            expr = expr + c
-            continue
-        monomial = c
-        for vname, power in tvars.items():
-            if vname in z3_vars:
-                for _ in range(int(power)):
-                    monomial = monomial * z3_vars[vname]
-        expr = expr + monomial
+        monomial = to_z3_coeff(term.get('c', 1))
+        for name, power in term.get('vars', {}).items():
+            if int(power) != power or power < 0:
+                raise ValueError(f'invalid exponent: {power}')
+            for _ in range(int(power)):
+                monomial = monomial * z3_vars[name]
+        expr += monomial
     return expr
 
-
 def eval_objective(model, obj_terms, z3_vars):
-    """Evaluate objective at a Z3 model using exact Fraction arithmetic."""
-    val = Fraction(0)
-    for term in obj_terms:
-        c = Fraction(term.get('c', 1)).limit_denominator(10**15)
-        tvars = term.get('vars', {})
-        if not tvars:
-            val += c
-            continue
-        tv = c
-        for vname, power in tvars.items():
-            if vname in z3_vars:
-                v = model[z3_vars[vname]]
-                if v is not None:
-                    tv *= Fraction(v.as_long()) ** int(power)
-        val += tv
-    r = float(val)
-    return int(r) if r == int(r) else r
-
-
-# ---------------------------------------------------------------------------
-#  Z3 model construction helpers
-# ---------------------------------------------------------------------------
+    from tools.verify import evaluate_polynomial
+    values = {name: model.eval(var, model_completion=True).as_long() for name, var in z3_vars.items()}
+    return evaluate_polynomial(obj_terms, values)
 
 def create_z3_vars(problem):
     """Create Z3 Int variables with domain bounds."""
@@ -113,33 +85,34 @@ def create_z3_vars(problem):
     for vname, info in problem.get('variables', {}).items():
         x = Int(vname)
         z3_vars[vname] = x
-        bounds.append(x >= int(info.get('lb', 0)))
-        bounds.append(x <= int(info.get('ub', 100)))
+        bounds.append(x >= to_z3_coeff(info['lb']))
+        bounds.append(x <= to_z3_coeff(info['ub']))
     return z3_vars, bounds
 
 
 def add_problem_constraints(ctx, problem, z3_vars):
-    """Add all parsed constraints (linear or quadratic) to a Z3 context."""
-    for constr in problem.get('constraints', []):
-        lhs = build_expr(constr.get('terms', []), z3_vars)
-        rhs = to_z3_coeff(constr.get('rhs', 0))
-        rel = constr.get('rel', constr.get('sense', '<='))
-        if   rel == '<=':       ctx.add(lhs <= rhs)
-        elif rel == '>=':       ctx.add(lhs >= rhs)
-        elif rel in ('==', '='): ctx.add(lhs == rhs)
-        elif rel == '<':        ctx.add(lhs < rhs)
-        elif rel == '>':        ctx.add(lhs > rhs)
-
+    def expression(c):
+        if c.get('type') == 'disjunction':
+            return Or([And([expression(a) for a in b]) for b in c['disjuncts']])
+        lhs = build_expr(c.get('terms', c.get('lhs', [])), z3_vars)
+        rhs = to_z3_coeff(c.get('rhs', 0))
+        rel = c.get('rel', c.get('sense', '<='))
+        return {'<=': lhs <= rhs, '>=': lhs >= rhs, '==': lhs == rhs,
+                '=': lhs == rhs, '<': lhs < rhs, '>': lhs > rhs}[rel]
+    for c in problem.get('constraints', []):
+        ctx.add(expression(c))
 
 def _handle_is_finite(handle):
-    """Check whether an Optimize handle has a concrete (finite) value."""
-    s = str(handle.value())
-    return s not in ('oo', '-1*oo', '+oo', '-oo', 'epsilon', '-epsilon')
+    return is_true(simplify(handle.lower() == handle.upper())) and 'oo' not in str(handle.value())
 
 
-# ---------------------------------------------------------------------------
-#  Phase 1 – Optimize()
-# ---------------------------------------------------------------------------
+def _checked_model(problem, model, z3_vars):
+    from tools.verify import evaluate_polynomial
+    values = {name: model.eval(var, model_completion=True).as_long() for name, var in z3_vars.items()}
+    objective = evaluate_polynomial(problem.get('objective', {}).get('terms', []), values)
+    return objective, values
+
+
 
 def _phase1_optimize(problem, z3_vars, bounds, obj_expr, obj_terms, is_max,
                      timeout):
@@ -155,20 +128,25 @@ def _phase1_optimize(problem, z3_vars, bounds, obj_expr, obj_terms, is_max,
     result = opt.check()
 
     if result == sat and _handle_is_finite(handle):
-        obj_val = eval_objective(opt.model(), obj_terms, z3_vars)
-        return {'status': 'OPTIMAL', 'objective': obj_val, 'proven': True}
+        obj_val, values = _checked_model(problem, opt.model(), z3_vars)
+        if not is_true(simplify(handle.value() == to_z3_coeff(obj_val))):
+            raise ValueError('Z3 optimum bound does not match its model')
+        # Nonlinear Optimize bounds require confirmation by the tightening phase.
+        if all(sum(term.get('vars', {}).values()) <= 1 for term in obj_terms):
+            return {'status': 'OPTIMAL', 'objective': obj_val, 'proven': True, 'witness': values}
 
     if result == unsat:
         return {'status': 'UNSAT', 'objective': None, 'proven': True}
 
     best_val = None
     best_z3_obj = None
+    values = None
     if result == sat:
         m = opt.model()
-        best_val = eval_objective(m, obj_terms, z3_vars)
+        best_val, values = _checked_model(problem, m, z3_vars)
         best_z3_obj = m.eval(obj_expr, model_completion=True)
 
-    return {'status': None, 'best_val': best_val, 'best_z3_obj': best_z3_obj}
+    return {'status': None, 'best_val': best_val, 'best_z3_obj': best_z3_obj, 'witness': values}
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +154,7 @@ def _phase1_optimize(problem, z3_vars, bounds, obj_expr, obj_terms, is_max,
 # ---------------------------------------------------------------------------
 
 def _phase2_iterative(problem, z3_vars, bounds, obj_expr, obj_terms, is_max,
-                      timeout_deadline, initial_val=None, initial_z3_obj=None):
+                      timeout_deadline, initial_val=None, initial_z3_obj=None, initial_witness=None):
     """Iteratively improve the objective with Z3 Solver.
 
     Returns (proven_optimal: bool, best_val, best_z3_obj).
@@ -186,6 +164,8 @@ def _phase2_iterative(problem, z3_vars, bounds, obj_expr, obj_terms, is_max,
         solver.add(b)
     add_problem_constraints(solver, problem, z3_vars)
 
+    witness = initial_witness
+    infeasible = False
     best_val = initial_val
     best_z3_obj = initial_z3_obj
     proven = False
@@ -208,7 +188,7 @@ def _phase2_iterative(problem, z3_vars, bounds, obj_expr, obj_terms, is_max,
 
         if r == sat:
             m = solver.model()
-            new_val = eval_objective(m, obj_terms, z3_vars)
+            new_val, values = _checked_model(problem, m, z3_vars)
             new_z3_obj = m.eval(obj_expr, model_completion=True)
             improved = (best_val is None
                         or (is_max and new_val > best_val)
@@ -216,17 +196,20 @@ def _phase2_iterative(problem, z3_vars, bounds, obj_expr, obj_terms, is_max,
             if improved:
                 best_val = new_val
                 best_z3_obj = new_z3_obj
+                witness = values
             solver.pop()
         elif r == unsat:
             solver.pop()
             if best_val is not None:
                 proven = True
+            else:
+                infeasible = True
             break
         else:
             solver.pop()
             break
 
-    return proven, best_val, best_z3_obj
+    return proven, best_val, best_z3_obj, witness, infeasible
 
 
 # ---------------------------------------------------------------------------
@@ -234,13 +217,32 @@ def _phase2_iterative(problem, z3_vars, bounds, obj_expr, obj_terms, is_max,
 # ---------------------------------------------------------------------------
 
 def solve_qplib(problem, timeout):
+    result = _solve_qplib(problem, timeout)
+    if result['status'] in ('OPTIMAL', 'FEASIBLE'):
+        from tools.verify import verify_values
+        start = time.perf_counter()
+        try:
+            actual, _, _ = verify_values(problem, result['witness'])
+            if actual != result['objective']:
+                raise ValueError('objective does not match original witness')
+            result['verified'] = True
+        except Exception as exc:
+            result.update(status='INVALID', verified=False, error_msg=str(exc))
+        result['time_verify'] = time.perf_counter() - start
+    return result
+
+
+def _solve_qplib(problem, timeout):
     """Solve a parsed QPLIB instance with Z3 (two-phase strategy)."""
     wall_start = time.perf_counter()
     deadline = wall_start + timeout
 
     obj_terms = problem.get('objective', {}).get('terms', [])
     sense = problem.get('objective', {}).get('sense', 'min')
-    is_max = (sense == 'max')
+    sense = str(sense).lower()
+    if sense not in ('max', 'maximize', 'maximum', 'min', 'minimize', 'minimum'):
+        raise ValueError(f'unsupported objective sense: {sense}')
+    is_max = sense.startswith('max')
 
     z3_vars, bounds = create_z3_vars(problem)
     obj_expr = build_expr(obj_terms, z3_vars)
@@ -265,21 +267,23 @@ def solve_qplib(problem, timeout):
     if remaining < 2:
         elapsed = time.perf_counter() - wall_start
         if best_val is not None:
-            return {'status': 'FEASIBLE', 'objective': best_val,
+            return {'status': 'FEASIBLE', 'objective': best_val, 'witness': p1.get('witness'),
                     'time': elapsed}
         return {'status': 'TIMEOUT' if elapsed >= timeout * 0.95 else 'UNKNOWN',
                 'objective': None, 'time': elapsed}
 
-    proven, best_val, _ = _phase2_iterative(
+    proven, best_val, _, witness, infeasible = _phase2_iterative(
         problem, z3_vars, bounds, obj_expr, obj_terms, is_max,
-        deadline, best_val, best_z3_obj)
+        deadline, best_val, best_z3_obj, p1.get('witness'))
 
     elapsed = time.perf_counter() - wall_start
 
+    if infeasible:
+        return {'status': 'UNSAT', 'objective': None, 'time': elapsed}
     if proven:
-        return {'status': 'OPTIMAL', 'objective': best_val, 'time': elapsed}
+        return {'status': 'OPTIMAL', 'objective': best_val, 'time': elapsed, 'witness': witness}
     if best_val is not None:
-        return {'status': 'FEASIBLE', 'objective': best_val, 'time': elapsed}
+        return {'status': 'FEASIBLE', 'objective': best_val, 'time': elapsed, 'witness': witness}
     if elapsed >= timeout * 0.95:
         return {'status': 'TIMEOUT', 'objective': None, 'time': elapsed}
     return {'status': 'UNKNOWN', 'objective': None, 'time': elapsed}
@@ -323,11 +327,17 @@ def solve_smt2(filepath, timeout):
             is_last = (idx == n - 1)
             budget_ms = remaining * 1000 if is_last else (remaining / (n - idx)) * 1000
 
-            r = _try_solver(make_solver(), filepath, budget_ms)
+            solver = make_solver()
+            r = _try_solver(solver, filepath, budget_ms)
 
             if r == sat:
                 elapsed = time.perf_counter() - wall_start
-                return {'status': 'SAT', 'objective': 'N/A', 'time': elapsed}
+                check_start = time.perf_counter()
+                model = solver.model()
+                if any(not is_true(simplify(model.eval(a, model_completion=True))) for a in solver.assertions()):
+                    raise ValueError('original SMT witness verification failed')
+                return {'status': 'SAT', 'objective': 'N/A', 'time': elapsed, 'verified': True,
+                        'time_verify': time.perf_counter() - check_start}
             if r == unsat:
                 elapsed = time.perf_counter() - wall_start
                 return {'status': 'UNSAT', 'objective': 'N/A', 'time': elapsed}
@@ -362,7 +372,7 @@ def main():
         print(f">>> Benchmark {name} Solver Z3 "
               f"Status ERROR OPT N/A TimeTotal 0.000")
         print("Z3 Python bindings not installed", file=sys.stderr)
-        return
+        return 1
 
     start_wall = time.perf_counter()
     try:
@@ -370,7 +380,9 @@ def main():
             result = solve_smt2(args.instance, args.timeout)
         else:
             problem = load_instance(args.instance, k=args.k)
-            result = solve_qplib(problem, args.timeout)
+            time_read = time.perf_counter() - start_wall
+            result = solve_qplib(problem, max(0.001, args.timeout - time_read))
+            result['time'] += time_read
     except Exception as e:
         elapsed = time.perf_counter() - start_wall
         msg = f'{type(e).__name__}: {e}'
@@ -384,15 +396,22 @@ def main():
                       'error_msg': msg}
         traceback.print_exc(file=sys.stderr)
 
-    obj_str = str(result['objective']) if result.get('objective') is not None else 'N/A'
+    obj = result.get('objective')
+    if isinstance(obj, Fraction):
+        print(f'ExactObjective {obj}')
+        obj = int(obj) if obj.denominator == 1 else float(obj)
+    obj_str = str(obj) if obj is not None else 'N/A'
     status = result['status']
 
     print(f">>> Benchmark {name} Solver Z3 "
-          f"Status {status} OPT {obj_str} TimeTotal {result.get('time', 0.0):.3f}")
+          f"Status {status} OPT {obj_str} TimeTotal {result.get('time', 0.0):.3f} "
+          f"TimeVerify {result.get('time_verify', 0.0):.3f}")
 
     if result.get('error_msg'):
         print(f"Error: {result['error_msg']}", file=sys.stderr)
 
+    return 1 if status in ('ERROR', 'INVALID', 'UNSUPPORTED') else 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 
-import math
 import itertools
 from typing import Dict, Any, List, Tuple
 from pysat.formula import WCNF, IDPool
+from .onehot import _check_deadline
 
 
 def encode_term_bin(
@@ -14,9 +14,11 @@ def encode_term_bin(
     z_prefix: str,
     lb_map: Dict[str, int] = None,
     for_objective: bool = False,
-    and_cache: Dict = None
+    and_cache: Dict = None,
+    deadline: float = 0.0
 ) -> Tuple[Dict[Tuple, Tuple[int, int]], List[List[int]], List[Tuple[List[int], int]]]:
 
+    _check_deadline(deadline)
     term_vars = term.get('vars', {}) or {}
     c = int(term.get('c', 1))
 
@@ -38,7 +40,7 @@ def encode_term_bin(
     # FIX: per-variable bit count (was global max, causing phantom bits for mixed ub)
     bit_ranges = []
     for _, _, ub in omega:
-        nb = math.ceil(math.log2(ub + 1)) if ub > 0 else 1
+        nb = max(1, ub.bit_length())
         bit_ranges.append(range(nb))
 
     x_fn = lambda q, r: vpool.id(f'x_{q}@{r}')
@@ -47,7 +49,9 @@ def encode_term_bin(
     hard_clauses = []
     direct_soft = []
 
-    for r_tuple in itertools.product(*bit_ranges):
+    for iteration, r_tuple in enumerate(itertools.product(*bit_ranges)):
+        if iteration % 2000 == 0:
+            _check_deadline(deadline)
         weight = c * (2 ** sum(r_tuple))
 
         # Optimization: for linear terms (k=1), use the variable literal directly
@@ -114,7 +118,8 @@ def encode_polynomial_bin(
     z_prefix: str = "z_bin",
     lb_map: Dict[str, int] = None,
     for_objective: bool = False,
-    external_and_cache: Dict = None
+    external_and_cache: Dict = None,
+    deadline: float = 0.0
 ) -> Tuple[Dict[Tuple, Tuple[int, int]], List[List[int]], List[Tuple[List[int], int]]]:
     if not terms:
         return {}, [], []
@@ -129,7 +134,7 @@ def encode_polynomial_bin(
         t_prefix = f"{z_prefix}_t{t_idx}"
         z_map, hard, direct = encode_term_bin(
             term, problem, name2idx, vpool, t_prefix, lb_map, for_objective,
-            and_cache=and_cache
+            and_cache=and_cache, deadline=deadline
         )
 
         for r_tuple, (z_var, weight) in z_map.items():
@@ -146,7 +151,8 @@ def encode_objective_bin(
     name2idx: Dict[str, int],
     vpool: IDPool,
     lb_map: Dict[str, int] = None,
-    external_and_cache: Dict = None
+    external_and_cache: Dict = None,
+    deadline: float = 0.0
 ) -> WCNF:
     w = WCNF()
     terms = problem['objective'].get('terms', [])
@@ -156,7 +162,7 @@ def encode_objective_bin(
 
     z_mapping, hard_clauses, direct_soft = encode_polynomial_bin(
         terms, problem, name2idx, vpool, "z_bin_obj", lb_map, for_objective=True,
-        external_and_cache=external_and_cache
+        external_and_cache=external_and_cache, deadline=deadline
     )
 
     for clause in hard_clauses:
@@ -191,7 +197,9 @@ def encode_objective_bin_with_decomposition(
     decomp_threshold: int = 3,
     decomp_strategy: str = "sequential",
     decomp_exact: bool = True,
-    decomp_shared: bool = True
+    decomp_shared: bool = True,
+    external_and_cache: Dict = None,
+    deadline: float = 0.0
 ) -> WCNF:
     from .decomposition import encode_term_decomp, MulCache
 
@@ -203,10 +211,12 @@ def encode_objective_bin_with_decomposition(
 
     # Shared substructure cache (paper Figure 3c)
     cache = MulCache() if decomp_shared else None
+    and_cache = external_and_cache if external_and_cache is not None else {}
 
     neg_soft_total = 0
 
     for t_idx, term in enumerate(terms):
+        _check_deadline(deadline)
         tv = term.get('vars', {}) or {}
         degree = sum(int(p) for p in tv.values())
         c = int(term.get('c', 1))
@@ -224,7 +234,7 @@ def encode_objective_bin_with_decomposition(
             bit_product = 1
             for vn, p in tv.items():
                 ub = int(problem['variables'][vn]['ub'])
-                nb = math.ceil(math.log2(ub + 1)) if ub > 0 else 1
+                nb = max(1, ub.bit_length())
                 bit_product *= nb ** int(p)
             if bit_product > 256:
                 use_decomp_for_term = True
@@ -232,13 +242,13 @@ def encode_objective_bin_with_decomposition(
         if use_decomp_for_term:
             z_mapping, hard_clauses = encode_term_decomp(
                 term, problem, name2idx, vpool, f"decomp_t{t_idx}", lb_map,
-                sense=sense, strategy=decomp_strategy, cache=cache
+                sense=sense, strategy=decomp_strategy, cache=cache, deadline=deadline
             )
             direct_soft = []
         else:
             z_mapping, hard_clauses, direct_soft = encode_term_bin(
                 term, problem, name2idx, vpool, f"z_bin_t{t_idx}", lb_map,
-                for_objective=True
+                for_objective=True, and_cache=and_cache, deadline=deadline
             )
 
         for clause in hard_clauses:
@@ -260,6 +270,6 @@ def encode_objective_bin_with_decomposition(
         w._neg_soft_total = neg_soft_total
 
     if cache is not None and len(cache) > 0:
-        print(f"  [decomp] shared Mul cache: {len(cache)} products reused")
+        print(f"  [decomp] cached products: {len(cache)}, cache hits: {cache.hits}")
 
     return w

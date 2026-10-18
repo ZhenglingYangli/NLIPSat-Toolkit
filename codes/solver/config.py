@@ -17,7 +17,7 @@ class EncodingConfig:
     Attributes
     ----------
     encoding : str
-        Default encoding name (``"OH"``, ``"UNA"``, ``"BIN"``).
+        Legacy metadata. Select the encoding with the API or CLI argument.
     use_decomposition : bool
         Enable order decomposition for high-degree terms in BIN encoding.
     decomp_threshold : int
@@ -31,24 +31,27 @@ class EncodingConfig:
     weight_gcd_normalize : bool
         Divide all soft weights by their GCD (improves core-guided solving).
     save_wcnf : bool
-        Whether to persist the generated WCNF file.
+        Legacy metadata. Export is controlled by the explicit output path.
     workdir : str
         Working directory for temporary files (default: system temp dir,
         override via ``NLIP_WORKDIR`` env var).
     maxhs_path, wmaxcdcl_path, openwbo_path : str
         Paths to external MaxSAT solver binaries (override via
         ``NLIP_MAXHS``, ``NLIP_WMAXCDCL``, ``NLIP_OPENWBO`` env vars).
-    external_solver_timeout : int
+    rc2_timeout : float
+        RC2 subprocess time limit in seconds, including startup (0 = unlimited).
+    external_solver_timeout : float
         Timeout in seconds for external solvers (0 = no timeout).
     enable_preprocess : bool
-        Enable lightweight preprocessing (variable shift, integerization,
-        objective normalization).
+        Enable optional bound propagation and monotone variable fixing.
+        Exact normalization and variable shifts always run.
     preprocess_integerize : bool
         Convert fractional coefficients to integers during preprocessing.
     preprocess_scale_limit : int
         Maximum scaling factor allowed during integerization.
     use_mapping_shift : bool
-        Use mapping *y = x − lb* during encoding (OH/UNA/BIN).
+        Mapping option for direct encoder calls. The solve pipeline always
+        normalizes variable lower bounds before encoding.
     encoding_deadline : float
         Absolute ``time.time()`` deadline for the encoding phase
         (0 = no deadline).
@@ -70,7 +73,8 @@ class EncodingConfig:
     maxhs_path: str = os.environ.get("NLIP_MAXHS", os.path.join(_SOLVER_DIR, "maxhs"))
     wmaxcdcl_path: str = os.environ.get("NLIP_WMAXCDCL", os.path.join(_SOLVER_DIR, "wmaxcdcl"))
     openwbo_path: str = os.environ.get("NLIP_OPENWBO", os.path.join(_SOLVER_DIR, "openwbo"))
-    external_solver_timeout: int = 0
+    external_solver_timeout: float = 0.0
+    rc2_timeout: float = 0.0
 
     enable_preprocess: bool = True
     preprocess_integerize: bool = True
